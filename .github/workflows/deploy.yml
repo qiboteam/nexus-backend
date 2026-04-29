@@ -1,0 +1,23 @@
+# Build wheels and (optionally) publish.
+#
+# Currently disabled by limiting triggers to manual `workflow_dispatch` only.
+# Once a PyPI release is decided, re-enable the `release: types: [published]`
+# trigger and have a maintainer publish via a tagged release.
+name: Build wheels and deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10']
+    uses: qiboteam/workflows/.github/workflows/deploy-pip-poetry.yml@v1
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}
+      publish: false
+      poetry-extras: ""
+    secrets: inherit

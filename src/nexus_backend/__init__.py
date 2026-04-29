@@ -1,0 +1,70 @@
+"""nexus-backend — Qibo backend for Quantinuum Nexus.
+
+Discovery contract for ``qibo.set_backend("nexus-backend", ...)``:
+Qibo's :func:`qibo.backends.construct_backend` translates the backend string
+``"nexus-backend"`` to the import name ``"nexus_backend"`` (literal ``-`` → ``_``
+substitution), imports this package, and looks up :class:`MetaBackend` on the
+top-level module to call its :meth:`MetaBackend.load` static method.
+
+The package therefore exposes :class:`MetaBackend` here, alongside the public
+:class:`NexusClientBackend` class for direct construction.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata as _im
+from typing import Any
+
+from .backend import EstimateItem, ExecutionEstimate, NexusClientBackend, run_compile_execute
+from .config import NexusBackendConfig
+
+try:  # pragma: no cover - importlib.metadata behaviour
+    __version__ = _im.version(__package__)
+except _im.PackageNotFoundError:  # pragma: no cover - editable / source checkout
+    __version__ = "0.0.0+unknown"
+
+PLATFORMS = ("hseries", "helios", "aer")
+"""Platform families understood by :class:`NexusBackendConfig`."""
+
+
+class MetaBackend:
+    """Loader contract Qibo's :func:`construct_backend` looks for.
+
+    ``qibo.set_backend("nexus-backend", platform="hseries:H2-1LE", project=...)``
+    eventually calls ``MetaBackend.load(platform=..., project=...)`` and assigns
+    the returned backend instance as the active Qibo backend.
+    """
+
+    @staticmethod
+    def load(platform: str | None = None, **kwargs: Any) -> NexusClientBackend:
+        """Instantiate :class:`NexusClientBackend`.
+
+        Args:
+            platform: Optional platform string (e.g. ``"hseries:H2-1LE"``,
+                ``"helios:Helios-1E"``, ``"aer:..."``). When ``None``, the
+                backend's own default (``"hseries:H2-1LE"``) is used.
+            **kwargs: Forwarded to :class:`NexusClientBackend` (``project``,
+                ``optimisation_level``, ``timeout``, etc.).
+        """
+        if platform is not None:
+            kwargs["platform"] = platform
+        return NexusClientBackend(**kwargs)
+
+    def list_available(self) -> dict[str, bool]:
+        """Report supported platform families.
+
+        Consumed by ``qibo.backends.list_available_backends("nexus-backend")``.
+        """
+        return {family: True for family in PLATFORMS}
+
+
+__all__ = [
+    "EstimateItem",
+    "ExecutionEstimate",
+    "MetaBackend",
+    "NexusBackendConfig",
+    "NexusClientBackend",
+    "PLATFORMS",
+    "__version__",
+    "run_compile_execute",
+]

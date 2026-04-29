@@ -1,0 +1,65 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "nexus-backend"
+version = "0.1.0"
+description = "Qibo backend for Quantinuum Nexus."
+authors = ["The Qibo team"]
+license = "Apache License 2.0"
+readme = "README.md"
+homepage = "https://qibo.science/"
+repository = "https://github.com/qiboteam/nexus-backend"
+documentation = "https://qibo.science/nexus-backend/stable"
+keywords = []
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+packages = [{ include = "nexus_backend", from = "src" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+qibo = "^0.2.16"
+qnexus = ">=0.39,<1"
+pytket = ">=2.8,<3"
+guppylang = ">=0.21,<1"
+
+[tool.poetry.group.tests]
+optional = true
+
+[tool.poetry.group.tests.dependencies]
+pytest = "^7.4"
+pytest-cov = "^4.1"
+pytest-mock = "^3.12"
+pylint = "^3.0"
+
+[tool.poetry.group.docs]
+optional = true
+
+[tool.poetry.group.docs.dependencies]
+sphinx = "^7.2"
+furo = "^2024.1"
+recommonmark = "^0.7"
+sphinx-copybutton = "^0.5"
+nbsphinx = "^0.9"
+
+[tool.poe.tasks]
+test = "pytest"
+lint = "pylint --errors-only src"
+lint-warnings = "pylint --exit-zero src"
+docs = "make -C doc html"
+docs-clean = "make -C doc clean"
+
+[tool.pylint.reports]
+output-format = "colorized"
+
+[tool.pytest.ini_options]
+testpaths = ['tests/']
+filterwarnings = ['ignore::RuntimeWarning']
+addopts = [
+  '--cov=src/nexus_backend',
+  '--cov-report=xml',
+  '--cov-report=html',
+]
