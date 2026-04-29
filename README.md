@@ -45,13 +45,6 @@ Supported platform families:
 - `helios:<system-name>` — Helios via HUGR (e.g. `helios:Helios-1E`)
 - `aer:<simulator-name>` — Qiskit Aer through Nexus
 
-## How discovery works
-
-Qibo's `construct_backend(...)` substitutes `-` with `_` in the backend
-string and imports the result as a Python package, then calls its top-level
-`MetaBackend.load(**kwargs)`. So `qibo.set_backend("nexus-backend", ...)`
-imports `nexus_backend`, which exposes `MetaBackend` returning a
-`NexusClientBackend` instance. No `entry_points` registration is required.
 
 ## License
 
