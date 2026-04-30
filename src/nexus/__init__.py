@@ -17,7 +17,12 @@ from __future__ import annotations
 import importlib.metadata as _im
 from typing import Any
 
-from .backend import EstimateItem, ExecutionEstimate, NexusClientBackend, run_compile_execute
+from .backend import (
+    EstimateItem,
+    ExecutionEstimate,
+    NexusClientBackend,
+    run_compile_execute,
+)
 from .config import NexusBackendConfig
 
 # PyPI distribution name (differs from the import package name "nexus").

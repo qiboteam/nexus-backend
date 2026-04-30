@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "nexus-backend"
-version = "0.1.0"
+version = "0.0.1"
 description = "Qibo backend for Quantinuum Nexus."
 authors = ["The Qibo team"]
 license = "Apache License 2.0"
@@ -21,7 +21,7 @@ packages = [{ include = "nexus", from = "src" }]
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"
-qibo = "^0.2.16"
+qibo = "^0.3.2"
 qnexus = ">=0.39,<1"
 pytket = ">=2.8,<3"
 guppylang = ">=0.21,<1"
