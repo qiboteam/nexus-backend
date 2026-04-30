@@ -15,7 +15,12 @@ from __future__ import annotations
 import importlib.metadata as _im
 from typing import Any
 
-from .backend import EstimateItem, ExecutionEstimate, NexusClientBackend, run_compile_execute
+from .backend import (
+    EstimateItem,
+    ExecutionEstimate,
+    NexusClientBackend,
+    run_compile_execute,
+)
 from .config import NexusBackendConfig
 
 try:  # pragma: no cover - importlib.metadata behaviour
