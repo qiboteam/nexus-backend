@@ -7,8 +7,8 @@ import sympy
 from qibo import gates
 from qibo.models import Circuit
 
-from nexus_backend.errors import NexusBackendError
-from nexus_backend.translation import (
+from nexus.errors import NexusBackendError
+from nexus.translation import (
     prepare_qibo_circuit,
     translate_qibo_to_pytket,
     translate_qibo_to_pytket_for_helios,

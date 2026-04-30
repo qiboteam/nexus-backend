@@ -5,12 +5,12 @@ import types
 from qibo import gates
 from qibo.models import Circuit
 
-from nexus_backend.helios import (
+from nexus.helios import (
     _build_entrypoint_source,
     build_helios_hugr_package,
     map_helios_result_to_qibo,
 )
-from nexus_backend.translation import TranslationMetadata
+from nexus.translation import TranslationMetadata
 
 
 def test_build_entrypoint_source_preserves_measurement_order() -> None:
@@ -31,7 +31,7 @@ def test_build_helios_hugr_package_loads_pytket_with_rebasing(
     calls: dict[str, object] = {}
 
     monkeypatch.setattr(
-        "nexus_backend.helios.translate_qibo_to_pytket_for_helios",
+        "nexus.helios.translate_qibo_to_pytket_for_helios",
         lambda circuit, parameters=None: (
             "pytket-circuit",
             TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="OPENQASM"),

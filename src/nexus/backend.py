@@ -557,7 +557,7 @@ def run_compile_execute(
 class NexusClientBackend(NumpyBackend):
     """Qibo backend that compiles and executes circuits through Quantinuum Nexus."""
 
-    name = "nexus-backend"
+    name = "nexus"
 
     def __init__(
         self,
@@ -575,7 +575,7 @@ class NexusClientBackend(NumpyBackend):
         **backend_options: Any,
     ) -> None:
         super().__init__()
-        self.name = "nexus-backend"
+        self.name = "nexus"
         _ensure_nexus_dependencies()
 
         self.config: NexusBackendConfig = NexusBackendConfig(

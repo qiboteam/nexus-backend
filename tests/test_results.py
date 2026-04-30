@@ -5,7 +5,7 @@ import types
 from qibo import gates
 from qibo.models import Circuit
 
-from nexus_backend.results import (
+from nexus.results import (
     map_counts_to_qibo_frequencies,
     map_nexus_result_to_qibo,
 )

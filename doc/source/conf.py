@@ -12,7 +12,7 @@ import sys
 from recommonmark.transform import AutoStructify
 
 sys.path.insert(0, os.path.abspath(".."))
-import nexus_backend
+import nexus
 
 # -- Project information -----------------------------------------------------
 
@@ -21,7 +21,7 @@ copyright = "The Qibo team"
 author = "The Qibo team"
 
 # The full version, including alpha/beta/rc tags
-release = nexus_backend.__version__
+release = nexus.__version__
 
 
 # -- General configuration ---------------------------------------------------

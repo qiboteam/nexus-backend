@@ -23,10 +23,10 @@ poetry install --with tests
 ```python
 import qibo
 
-# Tell Qibo to route circuits through Nexus.  The string "nexus-backend"
-# is mapped to the importable package `nexus_backend` and its top-level
+# Tell Qibo to route circuits through Nexus.  The string "nexus" is
+# mapped to the importable package `nexus` and its top-level
 # MetaBackend.load(**kwargs) is invoked under the hood.
-qibo.set_backend("nexus-backend", platform="hseries:H2-1LE")
+qibo.set_backend("nexus", platform="hseries:H2-1LE")
 
 circuit = qibo.models.QFT(5)
 circuit.add(qibo.gates.M(0, 2, 4))

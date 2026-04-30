@@ -6,9 +6,9 @@ import pytest
 from qibo import gates
 from qibo.models import Circuit
 
-import nexus_backend.backend as backend_mod
-from nexus_backend.errors import UnsupportedExecutionError
-from nexus_backend.translation import TranslationMetadata
+import nexus.backend as backend_mod
+from nexus.errors import UnsupportedExecutionError
+from nexus.translation import TranslationMetadata
 
 
 def make_measured_circuit(nqubits: int = 1, measured_qubits: tuple[int, ...] | None = None) -> Circuit:

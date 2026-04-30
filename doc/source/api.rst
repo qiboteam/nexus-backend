@@ -16,7 +16,7 @@ desired target using the ``platform`` argument, for example
    and project resolution happen lazily on the first execution or estimation
    call.
 
-.. autoclass:: nexus_backend.backend.NexusClientBackend
+.. autoclass:: nexus.backend.NexusClientBackend
     :members:
     :member-order: bysource
 
@@ -24,6 +24,6 @@ desired target using the ``platform`` argument, for example
 MetaBackend
 ^^^^^^^^^^^
 
-.. autoclass:: nexus_backend.MetaBackend
+.. autoclass:: nexus.MetaBackend
     :members:
     :member-order: bysource

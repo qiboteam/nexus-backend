@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from nexus_backend.config import (
+from nexus.config import (
     NexusBackendConfig,
     _should_use_helios_emulator,
     build_nexus_backend_config,
