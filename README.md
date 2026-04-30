@@ -35,16 +35,21 @@ result = circuit(nshots=1000)
 print(result.frequencies())
 ```
 
-The first execution call triggers Nexus authentication and resolves the project
-context. To configure a project explicitly, pass `project="my-project"` to
-`qibo.set_backend(...)`.
+## Authentication
 
-Supported platform families:
+Importing `nexus` does not contact Quantinuum Nexus. Authentication and project
+resolution happen lazily on the first `execute_*` or `estimate_*` call. To pin
+the project explicitly, pass `project="my-project"` to `qibo.set_backend(...)`;
+otherwise the backend resolves it from your Nexus account on first use.
+
+## Supported platforms
+
+Configure the desired target with the `platform` argument, e.g.
+`"hseries:H2-1LE"` or `"helios:Helios-1E"`.
 
 - `hseries:<device-name>` — Quantinuum H-Series (e.g. `hseries:H2-1LE`)
 - `helios:<system-name>` — Helios via HUGR (e.g. `helios:Helios-1E`)
 - `aer:<simulator-name>` — Qiskit Aer through Nexus
-
 
 ## License
 
