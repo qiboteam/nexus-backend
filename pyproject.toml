@@ -36,6 +36,7 @@ pylint = "^3.0"
 
 [tool.poe.tasks]
 test = "pytest"
+types = "true"
 lint = "pylint --errors-only src"
 lint-warnings = "pylint --exit-zero src"
 
