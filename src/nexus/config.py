@@ -70,6 +70,15 @@ def _should_use_helios_emulator(name: str, forced: Any) -> bool:
     return "emulator" in lowered or lowered.endswith("-1e")
 
 
+def helios_emulator_requested(cfg: NexusBackendConfig) -> bool:
+    """Whether the configured Helios target is (or is forced to be) an emulator."""
+
+    family, name = parse_platform(cfg.platform)
+    if family != "helios":
+        return False
+    return _should_use_helios_emulator(name, cfg.backend_options.get("emulator"))
+
+
 def _resolve_qnexus_model(qnx: Any, name: str) -> Any:
     model = getattr(qnx, name, None)
     if model is not None:
@@ -101,7 +110,6 @@ def _build_helios_backend_config(
     *,
     name: str,
     options: dict[str, Any],
-    n_qubits: int | None,
 ) -> Any:
     helios_config_cls = _resolve_qnexus_model(qnx, "HeliosConfig")
     helios_emulator_cls = _resolve_qnexus_model(qnx, "HeliosEmulatorConfig")
@@ -112,9 +120,11 @@ def _build_helios_backend_config(
     emulator_requested = _should_use_helios_emulator(name, forced_emulator)
 
     if emulator_requested and helios_emulator_cls is not None:
+        # Emulator sizing is no longer injected here: HeliosEmulatorConfig's
+        # n_qubits field is deprecated in favor of the per-item n_qubits kwarg
+        # on qnx.start_execute_job.  An explicit user-supplied n_qubits in
+        # backend_options is still forwarded verbatim.
         emulator_options = dict(options)
-        if n_qubits is not None:
-            emulator_options.setdefault("n_qubits", int(n_qubits))
 
         if _supports_parameter(helios_config_cls, "emulator_config"):
             # Split options: keys accepted by HeliosEmulatorConfig go on the
@@ -145,11 +155,7 @@ def _build_helios_backend_config(
     return _call_named_constructor(helios_config_cls, name=name, **options)
 
 
-def build_nexus_backend_config(
-    cfg: NexusBackendConfig,
-    *,
-    n_qubits: int | None = None,
-) -> Any:
+def build_nexus_backend_config(cfg: NexusBackendConfig) -> Any:
     """Build a concrete qnexus backend config object for compile/execute jobs."""
 
     try:
@@ -171,5 +177,4 @@ def build_nexus_backend_config(
         qnx,
         name=name,
         options=options,
-        n_qubits=n_qubits,
     )

@@ -8,6 +8,7 @@ from nexus.config import (
     NexusBackendConfig,
     _should_use_helios_emulator,
     build_nexus_backend_config,
+    helios_emulator_requested,
     parse_platform,
 )
 
@@ -91,13 +92,12 @@ def test_build_helios_emulator_config(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_build_helios_modern_config_uses_emulator_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """n_qubits sizes the HeliosEmulatorConfig; per-program max_cost is now
-    passed via qnx.start_execute_job (not the backend_config), so it does not
-    appear here."""
+    """Emulator sizing and per-program max_cost are now passed via
+    qnx.start_execute_job (n_qubits/max_cost per-item kwargs), so neither is
+    auto-injected into the deprecated HeliosEmulatorConfig fields."""
 
     class HeliosEmulatorConfig:
-        def __init__(self, *, n_qubits: int, simulator: str):
-            self.n_qubits = n_qubits
+        def __init__(self, *, simulator: str):
             self.simulator = simulator
 
     class HeliosConfig:
@@ -116,10 +116,23 @@ def test_build_helios_modern_config_uses_emulator_config(
         platform="helios:Helios-1E",
         backend_options={"simulator": "statevector", "emulator": True},
     )
-    concrete = build_nexus_backend_config(cfg, n_qubits=12)
+    concrete = build_nexus_backend_config(cfg)
     assert concrete.system_name == "Helios-1E"
-    assert concrete.emulator_config.n_qubits == 12
     assert concrete.emulator_config.simulator == "statevector"
+    assert not hasattr(concrete.emulator_config, "n_qubits")
+
+
+def test_helios_emulator_requested_reflects_platform_and_force_flag() -> None:
+    assert helios_emulator_requested(NexusBackendConfig(platform="helios:Helios-1E"))
+    assert not helios_emulator_requested(NexusBackendConfig(platform="helios:Helios-1"))
+    assert helios_emulator_requested(
+        NexusBackendConfig(
+            platform="helios:Helios-1", backend_options={"emulator": True}
+        )
+    )
+    assert not helios_emulator_requested(
+        NexusBackendConfig(platform="hseries:H2-1LE")
+    )
 
 
 def test_build_helios_emulator_config_ignores_helios_config_kwargs(

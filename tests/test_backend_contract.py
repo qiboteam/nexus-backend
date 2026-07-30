@@ -595,7 +595,10 @@ def test_execute_circuit_helios_uses_hugr_path(monkeypatch: pytest.MonkeyPatch) 
     assert calls["cost"] == (["hugr-ref"], [64])
     assert calls["execute"]["programs"] == ["hugr-ref"]
     assert "language" not in calls["execute"]
-    assert build_calls[-1]["n_qubits"] == 2
+    # HeliosEmulatorConfig.n_qubits is deprecated: emulator sizing goes through
+    # the per-item n_qubits kwarg on start_execute_job, never the config build.
+    assert all("n_qubits" not in call for call in build_calls)
+    assert calls["execute"]["n_qubits"] == 2
     # Estimated 1.25 HQC gets the default 1.2x headroom before max_cost submission.
     assert calls["execute"]["max_cost"] == pytest.approx(1.5)
     assert calls["map"]["execution_result_ref"] == "helios-result"
@@ -804,9 +807,11 @@ def test_execute_circuits_helios_emulator_propagates_per_program_limits(
     assert calls["execute"]["max_cost"] == pytest.approx([1.8, 5.1])
     assert calls["execute"]["n_shots"] == [10, 30]
 
-    # Emulator state is sized for the widest circuit (max nqubits across programs).
+    # Emulator sizing is per-program via start_execute_job(n_qubits=[...]);
+    # the deprecated HeliosEmulatorConfig.n_qubits is no longer auto-injected.
+    assert calls["execute"]["n_qubits"] == [1, 3]
     last_build = build_calls[-1]
-    assert last_build["n_qubits"] == 3
+    assert "n_qubits" not in last_build
 
     # No batching auto-injection on emulator (vendor: unsupported on Helios emulators).
     cfg = last_build["cfg"]
@@ -932,6 +937,22 @@ def test_execute_circuits_helios_user_max_cost_skips_estimation(
     assert "cost" not in calls
     # A scalar user max_cost is forwarded as-is; qnexus broadcasts it per program.
     assert calls["execute"]["max_cost"] == 9.0
+
+
+def test_execute_circuit_helios_hardware_omits_n_qubits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """n_qubits is an emulator sizing hint; hardware submissions must not
+    carry it."""
+    calls: dict[str, object] = {}
+    _patch_helios_env(monkeypatch, _make_helios_qnx(calls, cost_items=[(1.0, 84.0)]))
+
+    backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1", project="proj"
+    )
+    backend.execute_circuit(make_measured_circuit(1), nshots=10)
+
+    assert "n_qubits" not in calls["execute"]
 
 
 def test_execute_circuit_helios_max_cost_factor_is_configurable(

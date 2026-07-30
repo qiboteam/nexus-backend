@@ -14,7 +14,11 @@ from qibo.backends import NumpyBackend
 from qibo.models import Circuit
 
 from .auth import authenticate, ensure_project
-from .config import NexusBackendConfig, build_nexus_backend_config
+from .config import (
+    NexusBackendConfig,
+    build_nexus_backend_config,
+    helios_emulator_requested,
+)
 from .errors import (
     NexusBackendError,
     UnsupportedExecutionError,
@@ -465,6 +469,7 @@ def _execute_programs(
     job_name_prefix: str | None = None,
     project: Any = None,
     max_cost: float | list[float] | None = None,
+    n_qubits: int | list[int] | None = None,
 ) -> list[Any]:
     execute_name = _job_name(job_name_prefix, "execute", platform)
 
@@ -480,6 +485,8 @@ def _execute_programs(
             execute_kwargs["language"] = language
         if max_cost is not None:
             execute_kwargs["max_cost"] = max_cost
+        if n_qubits is not None:
+            execute_kwargs["n_qubits"] = n_qubits
         execute_job = qnx.start_execute_job(**execute_kwargs)
     except Exception as exc:  # noqa: BLE001
         raise NexusBackendError(f"Failed to submit execute job: {exc}") from exc
@@ -652,25 +659,12 @@ class NexusClientBackend(NumpyBackend):
             credential_login=self.config.credential_login,
         )
         self._project_ref = ensure_project(self.config.project)
+        self._backend_config = build_nexus_backend_config(self.config)
         if self.config.platform_family == "helios":
-            self._backend_config = None
             self._resolved_language = None
         else:
-            self._backend_config = build_nexus_backend_config(self.config)
             self._resolved_language = _resolve_language(self.config.language)
         self._connected = True
-
-    def _build_execution_backend_config(
-        self,
-        *,
-        nqubits: int | None = None,
-    ) -> Any:
-        if self.config.platform_family != "helios":
-            return self._backend_config
-        return build_nexus_backend_config(
-            self.config,
-            n_qubits=nqubits,
-        )
 
     def _map_execution_result(
         self,
@@ -787,14 +781,11 @@ class NexusClientBackend(NumpyBackend):
                     project=self._project_ref,
                 )
                 max_cost = estimated * self.config.max_cost_factor
-            backend_config = self._build_execution_backend_config(
-                nqubits=metadata.nqubits,
-            )
             execution_items = _execute_programs(
                 qnx=qnx,
                 programs=[program_ref],
                 n_shots=shots,
-                backend_config=backend_config,
+                backend_config=self._backend_config,
                 timeout=self.config.timeout,
                 allow_incomplete=self.config.allow_incomplete,
                 language=None,
@@ -802,6 +793,11 @@ class NexusClientBackend(NumpyBackend):
                 job_name_prefix=self.config.job_name_prefix,
                 project=self._project_ref,
                 max_cost=max_cost,
+                n_qubits=(
+                    metadata.nqubits
+                    if helios_emulator_requested(self.config)
+                    else None
+                ),
             )
         else:
             execution_items = run_compile_execute(
@@ -952,15 +948,11 @@ class NexusClientBackend(NumpyBackend):
                     float(c) * self.config.max_cost_factor for c in costs
                 ]
 
-            backend_config = self._build_execution_backend_config(
-                nqubits=max(m.nqubits for m in metadata_list),
-            )
-
             execution_items = _execute_programs(
                 qnx=qnx,
                 programs=program_refs,
                 n_shots=shot_values,
-                backend_config=backend_config,
+                backend_config=self._backend_config,
                 timeout=self.config.timeout,
                 allow_incomplete=self.config.allow_incomplete,
                 language=None,
@@ -968,6 +960,11 @@ class NexusClientBackend(NumpyBackend):
                 job_name_prefix=self.config.job_name_prefix,
                 project=self._project_ref,
                 max_cost=max_cost,
+                n_qubits=(
+                    [m.nqubits for m in metadata_list]
+                    if helios_emulator_requested(self.config)
+                    else None
+                ),
             )
 
             if len(execution_items) != len(circuits):
