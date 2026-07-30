@@ -21,6 +21,8 @@ class NexusBackendConfig:
     optimisation_level: int = 2
     timeout: float = 1800.0
     allow_incomplete: bool = False
+    max_cost: float | None = None
+    max_cost_factor: float = 1.2
     language: Any = None
     credential_login: bool | None = None
     batch_mode: bool = True

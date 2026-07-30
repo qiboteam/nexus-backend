@@ -358,6 +358,18 @@ _HELIOS_COST_SYSTEM_NAME = "Helios-1"
 # and only "Helios-1SC" exists as a syntax checker — emulator targets must still use this.
 
 
+def _validate_helios_cost(cost: float) -> None:
+    # qnexus substitutes (0.0, -1.0) when the server omits cost data; any real
+    # Helios program costs at least the 5 HQC base, so a non-positive estimate
+    # would submit max_cost=0.0 and instantly deplete the job.
+    if cost <= 0:
+        raise NexusBackendError(
+            f"Helios cost estimation returned a non-positive cost ({cost}). "
+            "The server likely omitted cost data. Pass max_cost explicitly to "
+            "the backend to skip automatic estimation."
+        )
+
+
 def _estimate_helios_cost(
     *,
     qnx: Any,
@@ -385,11 +397,13 @@ def _estimate_helios_cost(
             or items[0][0] is None
         ):
             raise ValueError(f"unexpected result shape: {items!r}")
-        return float(items[0][0])
+        cost = float(items[0][0])
     except (TypeError, ValueError) as exc:
         raise NexusBackendError(
             f"Invalid Helios cost estimate returned: {results!r}"
         ) from exc
+    _validate_helios_cost(cost)
+    return cost
 
 
 def _estimate_helios_costs_batch(
@@ -428,11 +442,13 @@ def _estimate_helios_costs_batch(
                 f"Invalid Helios cost estimate at index {idx}: {item!r}"
             )
         try:
-            costs.append(float(item[0]))
+            cost = float(item[0])
         except (TypeError, ValueError) as exc:
             raise NexusBackendError(
                 f"Invalid Helios cost estimate at index {idx}: {item!r}"
             ) from exc
+        _validate_helios_cost(cost)
+        costs.append(cost)
     return costs
 
 
@@ -583,6 +599,8 @@ class NexusClientBackend(NumpyBackend):
         optimisation_level: int = 2,
         timeout: float = 1800.0,
         allow_incomplete: bool = False,
+        max_cost: float | None = None,
+        max_cost_factor: float = 1.2,
         language: Any = None,
         credential_login: bool | None = None,
         batch_mode: bool = True,
@@ -601,6 +619,8 @@ class NexusClientBackend(NumpyBackend):
             optimisation_level=optimisation_level,
             timeout=timeout,
             allow_incomplete=allow_incomplete,
+            max_cost=max_cost,
+            max_cost_factor=max_cost_factor,
             language=language,
             credential_login=credential_login,
             batch_mode=batch_mode,
@@ -752,12 +772,16 @@ class NexusClientBackend(NumpyBackend):
 
         if self.config.platform_family == "helios":
             qnx = _import_qnexus()
-            max_cost = _estimate_helios_cost(
-                qnx=qnx,
-                program=program_ref,
-                nshots=shots,
-                project=self._project_ref,
-            )
+            if self.config.max_cost is not None:
+                max_cost = float(self.config.max_cost)
+            else:
+                estimated = _estimate_helios_cost(
+                    qnx=qnx,
+                    program=program_ref,
+                    nshots=shots,
+                    project=self._project_ref,
+                )
+                max_cost = estimated * self.config.max_cost_factor
             backend_config = self._build_execution_backend_config(
                 nqubits=metadata.nqubits,
             )
@@ -907,12 +931,21 @@ class NexusClientBackend(NumpyBackend):
                 program_refs.append(program_ref)
                 metadata_list.append(metadata)
 
-            costs = _estimate_helios_costs_batch(
-                qnx=qnx,
-                programs=program_refs,
-                n_shots=shot_values,
-                project=self._project_ref,
-            )
+            max_cost: float | list[float]
+            if self.config.max_cost is not None:
+                # Scalar user max_cost is forwarded as-is; qnexus broadcasts it
+                # to every program in the job.
+                max_cost = float(self.config.max_cost)
+            else:
+                costs = _estimate_helios_costs_batch(
+                    qnx=qnx,
+                    programs=program_refs,
+                    n_shots=shot_values,
+                    project=self._project_ref,
+                )
+                max_cost = [
+                    float(c) * self.config.max_cost_factor for c in costs
+                ]
 
             backend_config = self._build_execution_backend_config(
                 nqubits=max(m.nqubits for m in metadata_list),
@@ -929,7 +962,7 @@ class NexusClientBackend(NumpyBackend):
                 platform=self.config.platform,
                 job_name_prefix=self.config.job_name_prefix,
                 project=self._project_ref,
-                max_cost=[float(c) for c in costs],
+                max_cost=max_cost,
             )
 
             if len(execution_items) != len(circuits):

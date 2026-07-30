@@ -7,7 +7,7 @@ from qibo import gates
 from qibo.models import Circuit
 
 import nexus.backend as backend_mod
-from nexus.errors import UnsupportedExecutionError
+from nexus.errors import NexusBackendError, UnsupportedExecutionError
 from nexus.translation import TranslationMetadata
 
 
@@ -592,7 +592,8 @@ def test_execute_circuit_helios_uses_hugr_path(monkeypatch: pytest.MonkeyPatch) 
     assert calls["execute"]["programs"] == ["hugr-ref"]
     assert "language" not in calls["execute"]
     assert build_calls[-1]["n_qubits"] == 2
-    assert calls["execute"]["max_cost"] == 1.25
+    # Estimated 1.25 HQC gets the default 1.2x headroom before max_cost submission.
+    assert calls["execute"]["max_cost"] == pytest.approx(1.5)
     assert calls["map"]["execution_result_ref"] == "helios-result"
 
 
@@ -794,8 +795,9 @@ def test_execute_circuits_helios_emulator_propagates_per_program_limits(
 
     assert results == ["mapped-res-0", "mapped-res-1"]
 
-    # Per-program max_cost list and shots flow into start_execute_job (vendor pattern).
-    assert calls["execute"]["max_cost"] == [1.5, 4.25]
+    # Per-program max_cost list and shots flow into start_execute_job (vendor
+    # pattern), each estimate padded with the default 1.2x headroom factor.
+    assert calls["execute"]["max_cost"] == pytest.approx([1.8, 5.1])
     assert calls["execute"]["n_shots"] == [10, 30]
 
     # Emulator state is sized for the widest circuit (max nqubits across programs).
@@ -811,3 +813,135 @@ def test_execute_circuits_helios_emulator_propagates_per_program_limits(
     # `QuantinuumConfig(device_name=f"{system_name}SC")`, and only "Helios-1SC" exists.
     # Even when the user-target platform is Helios-1E, system_name must stay "Helios-1".
     assert calls["cost_system_name"] == "Helios-1"
+
+
+def _make_helios_qnx(
+    calls: dict[str, object], *, cost_items: list[tuple[float, float]]
+) -> types.SimpleNamespace:
+    class JobRef:
+        id = "execute-job-1"
+
+    return types.SimpleNamespace(
+        hugr=types.SimpleNamespace(
+            upload=lambda *, hugr_package, name, project: "hugr-ref",
+            cost_confidence=lambda *, programs, n_shots, **kw: calls.update(
+                {"cost": (list(programs), list(n_shots))}
+            )
+            or cost_items,
+        ),
+        start_execute_job=lambda **kwargs: calls.update({"execute": kwargs})
+        or JobRef(),
+        jobs=types.SimpleNamespace(
+            wait_for=lambda job, timeout: job,
+            results=lambda job, allow_incomplete=False: ["helios-result"],
+            status=lambda job: "COMPLETED",
+        ),
+    )
+
+
+def _patch_helios_env(monkeypatch: pytest.MonkeyPatch, qnx: types.SimpleNamespace):
+    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
+    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
+    monkeypatch.setattr(
+        backend_mod, "ensure_project", lambda project_name: "project-ref"
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "build_nexus_backend_config",
+        lambda cfg, **kwargs: "helios-backend-config",
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "build_helios_hugr_package",
+        lambda circuit, parameters=None, entrypoint_name="helios_entrypoint": (
+            "hugr-package",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="OPENQASM"),
+        ),
+    )
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+    monkeypatch.setattr(
+        backend_mod,
+        "map_helios_result_to_qibo",
+        lambda **kwargs: {"kind": "MeasurementOutcomes"},
+    )
+
+
+def test_execute_circuit_helios_rejects_non_positive_cost_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A (0.0, -1.0) tuple means the server omitted cost data; submitting with
+    max_cost=0.0 would instantly deplete the job, so execution must abort."""
+    calls: dict[str, object] = {}
+    _patch_helios_env(monkeypatch, _make_helios_qnx(calls, cost_items=[(0.0, -1.0)]))
+
+    backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1", project="proj", emulator=True
+    )
+    with pytest.raises(NexusBackendError, match="(?i)cost"):
+        backend.execute_circuit(make_measured_circuit(1), nshots=10)
+
+    assert "execute" not in calls
+
+
+def test_execute_circuit_helios_user_max_cost_skips_estimation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    _patch_helios_env(monkeypatch, _make_helios_qnx(calls, cost_items=[(1.0, 84.0)]))
+
+    backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1",
+        project="proj",
+        emulator=True,
+        max_cost=7.5,
+    )
+    result = backend.execute_circuit(make_measured_circuit(1), nshots=10)
+
+    assert result["kind"] == "MeasurementOutcomes"
+    assert "cost" not in calls
+    assert calls["execute"]["max_cost"] == 7.5
+
+
+def test_execute_circuits_helios_user_max_cost_skips_estimation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    qnx = _make_helios_qnx(calls, cost_items=[(1.0, 84.0), (2.0, 84.0)])
+    qnx.jobs.results = lambda job, allow_incomplete=False: ["res-0", "res-1"]
+    _patch_helios_env(monkeypatch, qnx)
+    monkeypatch.setattr(
+        backend_mod,
+        "map_helios_result_to_qibo",
+        lambda **kwargs: f"mapped-{kwargs['execution_result_ref']}",
+    )
+
+    backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1",
+        project="proj",
+        emulator=True,
+        max_cost=9.0,
+    )
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    results = backend.execute_circuits(circuits, nshots=[10, 20])
+
+    assert results == ["mapped-res-0", "mapped-res-1"]
+    assert "cost" not in calls
+    # A scalar user max_cost is forwarded as-is; qnexus broadcasts it per program.
+    assert calls["execute"]["max_cost"] == 9.0
+
+
+def test_execute_circuit_helios_max_cost_factor_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    _patch_helios_env(monkeypatch, _make_helios_qnx(calls, cost_items=[(1.25, 84.0)]))
+
+    backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1",
+        project="proj",
+        emulator=True,
+        max_cost_factor=2.0,
+    )
+    backend.execute_circuit(make_measured_circuit(1), nshots=10)
+
+    assert calls["execute"]["max_cost"] == pytest.approx(2.5)
