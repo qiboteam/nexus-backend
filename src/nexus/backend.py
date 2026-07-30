@@ -983,9 +983,7 @@ class NexusClientBackend(NumpyBackend):
                     n_shots=shot_values,
                     project=self._project_ref,
                 )
-                max_cost = [
-                    float(c) * self.config.max_cost_factor for c in costs
-                ]
+                max_cost = [float(c) * self.config.max_cost_factor for c in costs]
 
             execution_items = _execute_programs(
                 qnx=qnx,

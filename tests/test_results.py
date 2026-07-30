@@ -167,9 +167,7 @@ def test_map_nexus_result_orders_bits_within_register(monkeypatch) -> None:
 
         def get_counts(self, cbits=None):
             order = [bit1, bit0] if cbits is None else list(cbits)
-            return {
-                tuple(readout[(b.reg_name, b.index[0])] for b in order): 4
-            }
+            return {tuple(readout[(b.reg_name, b.index[0])] for b in order): 4}
 
     class ExecutionResultRef:
         def download_result(self):

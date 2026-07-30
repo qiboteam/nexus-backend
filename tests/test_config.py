@@ -144,9 +144,7 @@ def test_helios_emulator_requested_reflects_platform_and_force_flag() -> None:
             platform="helios:Helios-1", backend_options={"emulator": True}
         )
     )
-    assert not helios_emulator_requested(
-        NexusBackendConfig(platform="hseries:H2-1LE")
-    )
+    assert not helios_emulator_requested(NexusBackendConfig(platform="hseries:H2-1LE"))
 
 
 def test_build_helios_emulator_config_ignores_helios_config_kwargs(

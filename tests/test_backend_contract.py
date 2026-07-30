@@ -966,9 +966,7 @@ def test_execute_circuit_helios_hardware_omits_n_qubits(
     calls: dict[str, object] = {}
     _patch_helios_env(monkeypatch, _make_helios_qnx(calls, cost_items=[(1.0, 84.0)]))
 
-    backend = backend_mod.NexusClientBackend(
-        platform="helios:Helios-1", project="proj"
-    )
+    backend = backend_mod.NexusClientBackend(platform="helios:Helios-1", project="proj")
     backend.execute_circuit(make_measured_circuit(1), nshots=10)
 
     assert "n_qubits" not in calls["execute"]
