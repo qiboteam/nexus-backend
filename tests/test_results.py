@@ -73,8 +73,8 @@ def test_map_counts_preserves_non_sorted_measurement_order() -> None:
     assert freq["011"] == 3
 
 
-def test_map_counts_accepts_string_and_int_keys() -> None:
-    counts = {"11": 3, 0b01: 2}
+def test_map_counts_accepts_string_keys() -> None:
+    counts = {"11": 3, "01": 2}
     freq = map_counts_to_qibo_frequencies(
         counts,
         measured_qubits=[0, 1],
@@ -247,53 +247,6 @@ def test_map_nexus_result_excludes_unknown_registers_with_warning(
     assert any("tk_SCRATCH" in rec.message for rec in caplog.records)
 
 
-def test_map_nexus_result_warns_when_cbits_selection_rejected(
-    monkeypatch, caplog
-) -> None:
-    """A result that exposes c_bits but rejects the cbits kwarg falls back to
-    the default order — that fallback can corrupt ≥10-register circuits, so it
-    must be logged, not silent."""
-    import logging
-    from collections import Counter
-
-    class MeasurementOutcomes:
-        def __init__(self, measurements, backend=None, nshots=0, samples=None):
-            self.measurements = measurements
-            self.backend = backend
-            self.nshots = nshots
-            self.samples = samples
-
-    qibo_result = types.ModuleType("qibo.result")
-    qibo_result.MeasurementOutcomes = MeasurementOutcomes
-    monkeypatch.setitem(__import__("sys").modules, "qibo.result", qibo_result)
-
-    class BackendResult:
-        c_bits = {_FakeBit("m0", 0): 0}
-
-        def get_counts(self):  # no cbits kwarg
-            return {"0": 3}
-
-    class ExecutionResultRef:
-        def download_result(self):
-            return BackendResult()
-
-    circuit = Circuit(1)
-    circuit.add(gates.M(0, register_name="m0"))
-    with caplog.at_level(logging.WARNING, logger="nexus.results"):
-        result = map_nexus_result_to_qibo(
-            execution_result_ref=ExecutionResultRef(),
-            circuit=circuit,
-            backend=object(),
-            nshots=3,
-            measured_qubits=[0],
-            reverse_endianness=False,
-            register_order=["m0"],
-        )
-
-    row_counts = Counter(tuple(row) for row in result.samples.tolist())
-    assert row_counts[(0,)] == 3
-    assert any("cbits" in rec.message for rec in caplog.records)
-
 
 def test_map_nexus_result_register_order_ignored_without_cbits(monkeypatch) -> None:
     """Results that don't expose pytket-style c_bits (or reject the cbits
@@ -333,3 +286,49 @@ def test_map_nexus_result_register_order_ignored_without_cbits(monkeypatch) -> N
 
     row_counts = Counter(tuple(row) for row in result.samples.tolist())
     assert row_counts[(0, 1)] == 3
+
+
+import logging
+
+import pytest
+
+from nexus.errors import NexusResultMappingError
+from nexus.results import _ordered_cbits, normalize_bitstring
+
+
+def test_normalize_bitstring_rejects_unsupported_key_type() -> None:
+    with pytest.raises(NexusResultMappingError, match="Unsupported count key type"):
+        normalize_bitstring(
+            key=1.5, nbits=1, measured_qubits=[0], reverse_endianness=False
+        )
+
+
+def test_normalize_bitstring_rejects_width_overflow() -> None:
+    """A key wider than the measurement register means the counts don't belong
+    to this circuit; padding or truncating would corrupt results silently."""
+    with pytest.raises(NexusResultMappingError, match="width mismatch"):
+        normalize_bitstring(
+            key="101", nbits=2, measured_qubits=[0, 1], reverse_endianness=False
+        )
+
+
+
+
+
+
+
+def test_ordered_cbits_warns_when_no_declared_register_matches(caplog) -> None:
+    bit = types.SimpleNamespace(reg_name="weird", index=[0])
+    result = types.SimpleNamespace(c_bits=[bit])
+
+    with caplog.at_level(logging.WARNING, logger="nexus.results"):
+        assert _ordered_cbits(result, ["m0"]) is None
+
+    assert any("default" in rec.message for rec in caplog.records)
+
+
+def test_map_counts_infers_width_without_measured_qubits() -> None:
+    freq = map_counts_to_qibo_frequencies(
+        {"01": 3}, measured_qubits=[], reverse_endianness=False
+    )
+    assert freq["01"] == 3

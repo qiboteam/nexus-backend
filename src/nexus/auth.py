@@ -51,11 +51,7 @@ def ensure_project(project_name: str | None) -> Any:
         ) from exc
 
     try:
-        get_or_create = qnx.projects.get_or_create
-        try:
-            return get_or_create(name=project_name)
-        except TypeError:
-            return get_or_create(project_name)
+        return qnx.projects.get_or_create(name=project_name)
     except Exception as exc:
         raise NexusAuthError(
             f"Failed to initialize Nexus project '{project_name}': {exc}"

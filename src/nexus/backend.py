@@ -75,16 +75,6 @@ def _normalize_batch_nshots(nshots: Any, batch_size: int) -> int | list[int]:
     return int(nshots)
 
 
-def _resolve_language(language: Any) -> Any:
-    if language is not None:
-        return language
-    try:
-        return _import_qnexus().Language.AUTO
-    except Exception:  # pragma: no cover - import environment specific
-        # qnexus execute APIs accept string literals; keep a safe fallback.
-        return "AUTO"
-
-
 def _import_qnexus() -> Any:
     try:
         return import_module("qnexus")
@@ -114,11 +104,8 @@ def _ensure_nexus_dependencies() -> None:
 
 
 def _job_id(job: Any) -> str:
-    for attr in ("id", "job_id", "uid"):
-        value = getattr(job, attr, None)
-        if value is not None:
-            return str(value)
-    return "unknown"
+    value = getattr(job, "id", None)
+    return "unknown" if value is None else str(value)
 
 
 def _utc_stamp() -> str:
@@ -155,15 +142,7 @@ def _wait_for_job(qnx: Any, job: Any, *, timeout: float, stage: str) -> Any:
 def _extract_compiled_program_refs(compile_results: Any) -> list[Any]:
     if not compile_results:
         raise NexusBackendError("Compile job returned no results.")
-    outputs: list[Any] = []
-    for item in compile_results:
-        if hasattr(item, "get_output"):
-            outputs.append(item.get_output())
-        elif hasattr(item, "output"):
-            outputs.append(item.output)
-        else:
-            outputs.append(item)
-    return outputs
+    return [item.get_output() for item in compile_results]
 
 
 def _expand_n_shots(n_shots: int | list[int], program_count: int) -> list[int]:
@@ -277,7 +256,7 @@ def _estimate_prepared_compilation(
             "Compile-time HQC estimation is only supported for Quantinuum H2 systems."
         )
     syntax_checker = _resolve_estimate_syntax_checker(backend_config)
-    if syntax_checker is None:
+    if syntax_checker is None:  # pragma: no cover - _supports_hqc_estimation guards this
         raise NexusBackendError(
             "Could not derive an H2 syntax-checker target for compile-time HQC estimation."
         )
@@ -698,10 +677,13 @@ class NexusClientBackend(NumpyBackend):
         )
         self._project_ref = ensure_project(self.config.project)
         self._backend_config = build_nexus_backend_config(self.config)
-        if self.config.platform_family == "helios":
-            self._resolved_language = None
-        else:
-            self._resolved_language = _resolve_language(self.config.language)
+        # When language is None the kwarg is omitted from start_execute_job and
+        # qnexus's own default (Language.AUTO) applies.
+        self._resolved_language = (
+            None
+            if self.config.platform_family == "helios"
+            else self.config.language
+        )
         self._connected = True
 
     def _map_execution_result(

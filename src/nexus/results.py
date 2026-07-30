@@ -18,8 +18,6 @@ LOGGER = logging.getLogger(__name__)
 def _bits_from_key(key: Any) -> list[int]:
     if isinstance(key, str):
         return [int(ch) for ch in key.strip() if ch in {"0", "1"}]
-    if isinstance(key, int):
-        return [int(ch) for ch in bin(key)[2:]]
     if isinstance(key, Iterable):
         return [int(x) for x in key]
     raise NexusResultMappingError(f"Unsupported count key type: {type(key)}")
@@ -35,8 +33,6 @@ def normalize_bitstring(
     """Normalize backend count keys into Qibo-style binary strings."""
 
     bits = _bits_from_key(key)
-    if len(bits) < nbits:
-        bits = [0] * (nbits - len(bits)) + bits
     if len(bits) != nbits:
         raise NexusResultMappingError(
             f"Count key width mismatch. Expected {nbits}, received {len(bits)} for key={key!r}."
@@ -52,17 +48,8 @@ def normalize_bitstring(
     return "".join(str(bit) for bit in bits)
 
 
-def _download_backend_result(execution_result_ref: Any) -> Any:
-    if hasattr(execution_result_ref, "download_result"):
-        return execution_result_ref.download_result()
-    return execution_result_ref
-
-
 def _bit_sort_index(bit: Any) -> int:
-    index = getattr(bit, "index", 0)
-    if isinstance(index, (list, tuple)):
-        return int(index[0]) if index else 0
-    return int(index)
+    return int(bit.index[0])
 
 
 def _ordered_cbits(backend_result: Any, register_order: list[str] | None) -> Any:
@@ -86,10 +73,7 @@ def _ordered_cbits(backend_result: Any, register_order: list[str] | None) -> Any
     rank = {name: pos for pos, name in enumerate(register_order)}
     groups: dict[str, list[Any]] = {}
     for bit in c_bits:
-        name = getattr(bit, "reg_name", None)
-        if name is None:
-            return None
-        groups.setdefault(str(name), []).append(bit)
+        groups.setdefault(str(bit.reg_name), []).append(bit)
 
     known = [name for name in groups if name in rank]
     unknown = [name for name in groups if name not in rank]
@@ -119,30 +103,10 @@ def _ordered_cbits(backend_result: Any, register_order: list[str] | None) -> Any
 def _extract_counts(
     backend_result: Any, register_order: list[str] | None = None
 ) -> dict[Any, int]:
-    if hasattr(backend_result, "get_counts"):
-        cbits = _ordered_cbits(backend_result, register_order)
-        if cbits is not None:
-            try:
-                counts = backend_result.get_counts(cbits=cbits)
-            except TypeError:
-                LOGGER.warning(
-                    "Backend result rejected the cbits selection; falling "
-                    "back to the default bit order, which may not follow "
-                    "measurement order."
-                )
-                counts = backend_result.get_counts()
-        else:
-            counts = backend_result.get_counts()
-    elif isinstance(backend_result, dict):
-        counts = backend_result
-    else:
-        raise NexusResultMappingError(
-            f"Unsupported backend result type '{type(backend_result)}'."
-        )
-
-    if not isinstance(counts, dict):
-        raise NexusResultMappingError("Nexus get_counts() did not return a dictionary.")
-    return counts
+    cbits = _ordered_cbits(backend_result, register_order)
+    if cbits is not None:
+        return backend_result.get_counts(cbits=cbits)
+    return backend_result.get_counts()
 
 
 def map_counts_to_qibo_frequencies(
@@ -183,7 +147,7 @@ def map_nexus_result_to_qibo(
 ) -> Any:
     """Download and convert a Nexus execution result to a Qibo result object."""
 
-    backend_result = _download_backend_result(execution_result_ref)
+    backend_result = execution_result_ref.download_result()
     counts = _extract_counts(backend_result, register_order)
     frequencies = map_counts_to_qibo_frequencies(
         counts,

@@ -95,80 +95,31 @@ def helios_emulator_requested(cfg: NexusBackendConfig) -> bool:
     return _should_use_helios_emulator(name, cfg.backend_options.get("emulator"))
 
 
-def _resolve_qnexus_model(qnx: Any, name: str) -> Any:
-    model = getattr(qnx, name, None)
-    if model is not None:
-        return model
-    models = getattr(qnx, "models", None)
-    if models is None:
-        return None
-    return getattr(models, name, None)
-
-
-def _call_named_constructor(model: Any, *, name: str, **kwargs: Any) -> Any:
-    for field_name in ("system_name", "hardware_name", "device_name"):
-        try:
-            return model(**{field_name: name, **kwargs})
-        except TypeError:
-            continue
-    return model(name=name, **kwargs)
-
-
 def _supports_parameter(model: Any, parameter: str) -> bool:
-    try:
-        return parameter in inspect.signature(model).parameters
-    except (TypeError, ValueError):
-        return False
+    return parameter in inspect.signature(model).parameters
 
 
-def _build_helios_backend_config(
-    qnx: Any,
-    *,
-    name: str,
-    options: dict[str, Any],
-) -> Any:
-    helios_config_cls = _resolve_qnexus_model(qnx, "HeliosConfig")
-    helios_emulator_cls = _resolve_qnexus_model(qnx, "HeliosEmulatorConfig")
-    if helios_config_cls is None:
-        return qnx.QuantinuumConfig(device_name=name, **options)
+def _build_helios_backend_config(*, name: str, options: dict[str, Any]) -> Any:
+    from qnexus.models import HeliosConfig, HeliosEmulatorConfig
 
     forced_emulator = options.pop("emulator", None)
-    emulator_requested = _should_use_helios_emulator(name, forced_emulator)
+    if not _should_use_helios_emulator(name, forced_emulator):
+        return HeliosConfig(system_name=name, **options)
 
-    if emulator_requested and helios_emulator_cls is not None:
-        # Emulator sizing is no longer injected here: HeliosEmulatorConfig's
-        # n_qubits field is deprecated in favor of the per-item n_qubits kwarg
-        # on qnx.start_execute_job.  An explicit user-supplied n_qubits in
-        # backend_options is still forwarded verbatim.
-        emulator_options = dict(options)
-
-        if _supports_parameter(helios_config_cls, "emulator_config"):
-            # Split options: keys accepted by HeliosEmulatorConfig go on the
-            # emulator; any remaining user-supplied options (e.g. attempt_batching
-            # for real Helios-1) belong on HeliosConfig.
-            emulator_only = {
-                k: v
-                for k, v in emulator_options.items()
-                if _supports_parameter(helios_emulator_cls, k)
-            }
-            helios_level = {
-                k: v
-                for k, v in emulator_options.items()
-                if not _supports_parameter(helios_emulator_cls, k)
-            }
-            emulator_config = helios_emulator_cls(**emulator_only)
-            return _call_named_constructor(
-                helios_config_cls,
-                name=name,
-                emulator_config=emulator_config,
-                **helios_level,
-            )
-
-        return _call_named_constructor(
-            helios_emulator_cls, name=name, **emulator_options
-        )
-
-    return _call_named_constructor(helios_config_cls, name=name, **options)
+    # Split options: keys accepted by HeliosEmulatorConfig go on the emulator;
+    # any remaining user-supplied options (e.g. attempt_batching for real
+    # Helios-1) belong on HeliosConfig.  Emulator sizing is not injected here:
+    # n_qubits rides the per-item kwarg on qnx.start_execute_job unless the
+    # user set it explicitly in backend_options.
+    emulator_options = {
+        k: v for k, v in options.items() if _supports_parameter(HeliosEmulatorConfig, k)
+    }
+    helios_options = {k: v for k, v in options.items() if k not in emulator_options}
+    return HeliosConfig(
+        system_name=name,
+        emulator_config=HeliosEmulatorConfig(**emulator_options),
+        **helios_options,
+    )
 
 
 def build_nexus_backend_config(cfg: NexusBackendConfig) -> Any:
@@ -189,8 +140,4 @@ def build_nexus_backend_config(cfg: NexusBackendConfig) -> Any:
         options.pop("emulator", None)
         return qnx.QuantinuumConfig(device_name=name, **options)
 
-    return _build_helios_backend_config(
-        qnx,
-        name=name,
-        options=options,
-    )
+    return _build_helios_backend_config(name=name, options=options)

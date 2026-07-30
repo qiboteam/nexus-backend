@@ -75,32 +75,60 @@ def test_build_hseries_config(monkeypatch: pytest.MonkeyPatch) -> None:
     assert concrete.device_name == "H2-1LE"
 
 
-def test_build_helios_emulator_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    class HeliosConfig:
-        def __init__(self, *, hardware_name: str, **kwargs):
-            self.kind = "hardware"
-            self.hardware_name = hardware_name
-            self.kwargs = kwargs
+def _install_helios_models(
+    monkeypatch: pytest.MonkeyPatch, *, helios_config, helios_emulator_config
+) -> None:
+    models_mod = types.ModuleType("qnexus.models")
+    models_mod.HeliosConfig = helios_config
+    models_mod.HeliosEmulatorConfig = helios_emulator_config
+    qnx_mod = types.ModuleType("qnexus")
+    qnx_mod.models = models_mod
+    sys_modules = __import__("sys").modules
+    monkeypatch.setitem(sys_modules, "qnexus", qnx_mod)
+    monkeypatch.setitem(sys_modules, "qnexus.models", models_mod)
 
-    class HeliosEmulatorConfig:
-        def __init__(self, *, hardware_name: str, **kwargs):
-            self.kind = "emulator"
-            self.hardware_name = hardware_name
-            self.kwargs = kwargs
 
-    fake_qnx = types.SimpleNamespace(
-        QuantinuumConfig=object,
-        HeliosConfig=HeliosConfig,
-        HeliosEmulatorConfig=HeliosEmulatorConfig,
+class _HeliosEmulatorConfig:
+    def __init__(self, *, simulator: str = "statevector"):
+        self.simulator = simulator
+
+
+class _HeliosConfig:
+    def __init__(self, *, system_name: str, emulator_config=None):
+        self.system_name = system_name
+        self.emulator_config = emulator_config
+
+
+def test_build_helios_hardware_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_helios_models(
+        monkeypatch,
+        helios_config=_HeliosConfig,
+        helios_emulator_config=_HeliosEmulatorConfig,
     )
-    monkeypatch.setitem(__import__("sys").modules, "qnexus", fake_qnx)
+
+    cfg = NexusBackendConfig(platform="helios:Helios-1")
+    concrete = build_nexus_backend_config(cfg)
+
+    assert concrete.system_name == "Helios-1"
+    assert concrete.emulator_config is None
+
+
+def test_build_helios_config_forced_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """emulator=True in backend_options must attach an emulator config even for
+    a hardware-named target."""
+    _install_helios_models(
+        monkeypatch,
+        helios_config=_HeliosConfig,
+        helios_emulator_config=_HeliosEmulatorConfig,
+    )
 
     cfg = NexusBackendConfig(
         platform="helios:Helios-1", backend_options={"emulator": True}
     )
     concrete = build_nexus_backend_config(cfg)
-    assert concrete.kind == "emulator"
-    assert concrete.hardware_name == "Helios-1"
+
+    assert concrete.system_name == "Helios-1"
+    assert isinstance(concrete.emulator_config, _HeliosEmulatorConfig)
 
 
 def test_build_helios_modern_config_uses_emulator_config(
@@ -110,21 +138,11 @@ def test_build_helios_modern_config_uses_emulator_config(
     qnx.start_execute_job (n_qubits/max_cost per-item kwargs), so neither is
     auto-injected into the deprecated HeliosEmulatorConfig fields."""
 
-    class HeliosEmulatorConfig:
-        def __init__(self, *, simulator: str):
-            self.simulator = simulator
-
-    class HeliosConfig:
-        def __init__(self, *, system_name: str, emulator_config=None):
-            self.system_name = system_name
-            self.emulator_config = emulator_config
-
-    fake_qnx = types.SimpleNamespace(
-        QuantinuumConfig=object,
-        HeliosConfig=HeliosConfig,
-        HeliosEmulatorConfig=HeliosEmulatorConfig,
+    _install_helios_models(
+        monkeypatch,
+        helios_config=_HeliosConfig,
+        helios_emulator_config=_HeliosEmulatorConfig,
     )
-    monkeypatch.setitem(__import__("sys").modules, "qnexus", fake_qnx)
 
     cfg = NexusBackendConfig(
         platform="helios:Helios-1E",
@@ -172,12 +190,11 @@ def test_build_helios_emulator_config_ignores_helios_config_kwargs(
             self.attempt_batching = attempt_batching
             self.max_batch_cost = max_batch_cost
 
-    fake_qnx = types.SimpleNamespace(
-        QuantinuumConfig=object,
-        HeliosConfig=HeliosConfig,
-        HeliosEmulatorConfig=HeliosEmulatorConfig,
+    _install_helios_models(
+        monkeypatch,
+        helios_config=HeliosConfig,
+        helios_emulator_config=HeliosEmulatorConfig,
     )
-    monkeypatch.setitem(__import__("sys").modules, "qnexus", fake_qnx)
 
     cfg = NexusBackendConfig(
         platform="helios:Helios-1E",
@@ -214,3 +231,14 @@ def test_build_aer_config(monkeypatch: pytest.MonkeyPatch) -> None:
     concrete = build_nexus_backend_config(cfg)
     assert concrete.kwargs["seed_simulator"] == 11
     assert concrete.kwargs["method"] == "statevector"
+
+
+def test_platform_name_property() -> None:
+    assert NexusBackendConfig(platform="hseries:H2-1LE").platform_name == "H2-1LE"
+
+
+def test_parse_platform_rejects_blank_family_or_name() -> None:
+    with pytest.raises(ValueError, match="Expected '<family>:<name>'"):
+        parse_platform("helios: ")
+    with pytest.raises(ValueError, match="Expected '<family>:<name>'"):
+        parse_platform(" :Helios-1")

@@ -93,12 +93,13 @@ def _replace_unitary_basis_rotations(circuit: Circuit) -> Circuit:
     y_rot_matrix = (matrices.Y + matrices.Z) / math.sqrt(2)
 
     def _is_y_basis_rotation(g: Any) -> bool:
+        # Gate.matrix is a backend-taking method in current qibo; the raw
+        # constructor matrix is parameters[0].
         return (
             isinstance(g, gates.Unitary)
             and len(g.target_qubits) == 1
-            and getattr(g, "matrix", None) is not None
-            and g.matrix.shape == (2, 2)
-            and bool(np.allclose(g.matrix, y_rot_matrix))
+            and np.shape(g.parameters[0]) == (2, 2)
+            and bool(np.allclose(g.parameters[0], y_rot_matrix))
         )
 
     if not any(_is_y_basis_rotation(g) for g in circuit.queue):
@@ -157,10 +158,7 @@ def prepare_qibo_circuit(
         working = working.decompose()
 
     try:
-        try:
-            qasm = working.to_qasm(extended_compatibility=True)
-        except TypeError:
-            qasm = working.to_qasm()
+        qasm = working.to_qasm(extended_compatibility=True)
     except Exception as exc:
         raise NexusBackendError(
             f"Failed to export Qibo circuit to OpenQASM: {exc}"
@@ -213,10 +211,7 @@ def translate_qibo_to_pytket_for_helios(
 
     stripped = _strip_measurements(working)
     try:
-        try:
-            qasm = stripped.to_qasm(extended_compatibility=True)
-        except TypeError:
-            qasm = stripped.to_qasm()
+        qasm = stripped.to_qasm(extended_compatibility=True)
     except Exception as exc:
         raise NexusBackendError(
             f"Failed to export measurement-free Qibo circuit to OpenQASM: {exc}"

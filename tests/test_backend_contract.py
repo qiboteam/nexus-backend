@@ -987,3 +987,267 @@ def test_execute_circuit_helios_max_cost_factor_is_configurable(
     backend.execute_circuit(make_measured_circuit(1), nshots=10)
 
     assert calls["execute"]["max_cost"] == pytest.approx(2.5)
+
+
+def test_execute_and_estimate_circuits_trivial_inputs(
+    backend: backend_mod.NexusClientBackend,
+) -> None:
+    circuits = [make_measured_circuit(1)]
+    with pytest.raises(UnsupportedExecutionError, match="initial_states"):
+        backend.execute_circuits(circuits, initial_states=[1, 0])
+    with pytest.raises(UnsupportedExecutionError, match="initial_states"):
+        backend.estimate_circuits(circuits, initial_states=[1, 0])
+
+    assert backend.execute_circuits([]) == []
+    empty_estimate = backend.estimate_circuits([])
+    assert empty_estimate.total_hqcs == 0.0
+    assert empty_estimate.items == []
+
+
+def test_execute_and_estimate_circuits_parameters_cardinality_mismatch(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    with pytest.raises(ValueError, match="parameters_list cardinality mismatch"):
+        backend.execute_circuits(circuits, nshots=10, parameters_list=[None])
+    with pytest.raises(ValueError, match="parameters_list cardinality mismatch"):
+        backend.estimate_circuits(circuits, nshots=10, parameters_list=[None])
+
+    calls: dict[str, object] = {}
+    _patch_helios_env(monkeypatch, _make_helios_qnx(calls, cost_items=[(1.0, 84.0)]))
+    helios_backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1", project="proj"
+    )
+    with pytest.raises(ValueError, match="parameters_list cardinality mismatch"):
+        helios_backend.execute_circuits(circuits, nshots=10, parameters_list=[None])
+
+
+def test_execute_circuits_helios_scalar_nshots_broadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    qnx = _make_helios_qnx(calls, cost_items=[(1.0, 84.0), (2.0, 84.0)])
+    qnx.jobs.results = lambda job, allow_incomplete=False: ["res-0", "res-1"]
+    _patch_helios_env(monkeypatch, qnx)
+
+    backend = backend_mod.NexusClientBackend(platform="helios:Helios-1", project="proj")
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    results = backend.execute_circuits(circuits, nshots=50)
+
+    assert len(results) == 2
+    assert calls["cost"] == (["hugr-ref", "hugr-ref"], [50, 50])
+    assert calls["execute"]["n_shots"] == [50, 50]
+
+
+def test_execute_circuits_helios_result_count_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch that comes back with fewer results than circuits must fail loudly
+    instead of silently mapping results to the wrong circuits."""
+    calls: dict[str, object] = {}
+    qnx = _make_helios_qnx(calls, cost_items=[(1.0, 84.0), (2.0, 84.0)])
+    qnx.jobs.results = lambda job, allow_incomplete=False: ["res-0"]
+    _patch_helios_env(monkeypatch, qnx)
+
+    backend = backend_mod.NexusClientBackend(platform="helios:Helios-1", project="proj")
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    with pytest.raises(NexusBackendError, match="returned 1 items"):
+        backend.execute_circuits(circuits, nshots=[10, 20])
+
+
+def test_execute_circuits_non_batch_runs_sequentially(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
+    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
+    monkeypatch.setattr(
+        backend_mod, "ensure_project", lambda project_name: "project-ref"
+    )
+    monkeypatch.setattr(
+        backend_mod, "build_nexus_backend_config", lambda cfg: "backend-config"
+    )
+    monkeypatch.setattr(
+        backend_mod.NexusClientBackend,
+        "_upload_translated_program",
+        lambda self, circuit, *, parameters=None, sequence_idx=0: (
+            f"program-ref-{sequence_idx}",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+    run_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        backend_mod,
+        "run_compile_execute",
+        lambda **kwargs: run_calls.append(kwargs) or ["item"],
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "map_nexus_result_to_qibo",
+        lambda **kwargs: f"mapped-{kwargs['nshots']}",
+    )
+
+    backend = backend_mod.NexusClientBackend(
+        platform="hseries:H2-1LE", project="proj", batch_mode=False
+    )
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+
+    assert backend.execute_circuits(circuits, nshots=7) == ["mapped-7", "mapped-7"]
+    assert [call["n_shots"] for call in run_calls] == [7, 7]
+
+    run_calls.clear()
+    assert backend.execute_circuits(circuits, nshots=[5, 6]) == [
+        "mapped-5",
+        "mapped-6",
+    ]
+    assert [call["n_shots"] for call in run_calls] == [5, 6]
+
+    with pytest.raises(ValueError, match="nshots cardinality mismatch"):
+        backend.execute_circuits(circuits, nshots=[5])
+    with pytest.raises(ValueError, match="parameters_list cardinality mismatch"):
+        backend.execute_circuits(circuits, nshots=7, parameters_list=[None])
+
+
+def test_execute_circuits_batch_result_cardinality_mismatch(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        backend_mod.NexusClientBackend,
+        "_upload_translated_program",
+        lambda self, circuit, *, parameters=None, sequence_idx=0: (
+            f"program-ref-{sequence_idx}",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+    monkeypatch.setattr(
+        backend_mod, "run_compile_execute", lambda **kwargs: ["only-one-item"]
+    )
+
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    with pytest.raises(NexusBackendError, match="Result cardinality mismatch"):
+        backend.execute_circuits(circuits, nshots=[10, 20])
+
+
+def test_estimate_circuits_helios_scalar_nshots_broadcast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    _patch_helios_env(
+        monkeypatch, _make_helios_qnx(calls, cost_items=[(1.5, 84.0), (2.5, 84.0)])
+    )
+
+    backend = backend_mod.NexusClientBackend(platform="helios:Helios-1", project="proj")
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    estimate = backend.estimate_circuits(circuits, nshots=30)
+
+    assert calls["cost"] == (["hugr-ref", "hugr-ref"], [30, 30])
+    assert [item.nshots for item in estimate.items] == [30, 30]
+    assert estimate.total_hqcs == 4.0
+
+
+def test_estimate_circuits_non_batch_scalar_and_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
+    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
+    monkeypatch.setattr(
+        backend_mod, "ensure_project", lambda project_name: "project-ref"
+    )
+    monkeypatch.setattr(
+        backend_mod, "build_nexus_backend_config", lambda cfg: "backend-config"
+    )
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: types.SimpleNamespace())
+    monkeypatch.setattr(
+        backend_mod.NexusClientBackend,
+        "_upload_translated_program",
+        lambda self, circuit, *, parameters=None, sequence_idx=0: (
+            f"program-ref-{sequence_idx}",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "_prepare_compiled_programs",
+        lambda **kwargs: backend_mod._PreparedCompilation(
+            compiled_programs=["compiled"],
+            submission_n_shots=kwargs["n_shots"],
+            shot_values=[kwargs["n_shots"]],
+            compile_job_id="compile-1",
+            batch_mode=False,
+        ),
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "_estimate_prepared_compilation",
+        lambda **kwargs: backend_mod.ExecutionEstimate(
+            platform="hseries:H2-1LE",
+            optimisation_level=2,
+            batch_mode=False,
+            total_hqcs=1.0,
+            items=[
+                backend_mod.EstimateItem(
+                    sequence_idx=0,
+                    nshots=kwargs["prepared"].shot_values[0],
+                    hqcs=1.0,
+                    compile_job_id="compile-1",
+                )
+            ],
+        ),
+    )
+
+    backend = backend_mod.NexusClientBackend(
+        platform="hseries:H2-1LE", project="proj", batch_mode=False
+    )
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+
+    estimate = backend.estimate_circuits(circuits, nshots=15)
+    assert [item.nshots for item in estimate.items] == [15, 15]
+
+    with pytest.raises(ValueError, match="nshots cardinality mismatch"):
+        backend.estimate_circuits(circuits, nshots=[15])
+
+
+def test_upload_translated_program_wraps_upload_failures(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        backend_mod,
+        "translate_qibo_to_pytket",
+        lambda circuit, parameters=None: (
+            "pytket-circuit",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+    failing_qnx = types.SimpleNamespace(
+        circuits=types.SimpleNamespace(
+            upload=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("full"))
+        ),
+        hugr=types.SimpleNamespace(
+            upload=lambda **kwargs: (_ for _ in ()).throw(RuntimeError("full"))
+        ),
+    )
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: failing_qnx)
+
+    with pytest.raises(NexusBackendError, match="Failed to upload circuit"):
+        backend._upload_translated_program(make_measured_circuit(1))
+
+    monkeypatch.setattr(
+        backend_mod,
+        "build_helios_hugr_package",
+        lambda circuit, parameters=None, entrypoint_name="helios_entrypoint": (
+            "hugr-package",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
+    monkeypatch.setattr(
+        backend_mod, "ensure_project", lambda project_name: "project-ref"
+    )
+    monkeypatch.setattr(
+        backend_mod, "build_nexus_backend_config", lambda cfg: "helios-config"
+    )
+    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
+    helios_backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1", project="proj"
+    )
+    with pytest.raises(NexusBackendError, match="Failed to upload Helios HUGR"):
+        helios_backend._upload_translated_program(make_measured_circuit(1))
