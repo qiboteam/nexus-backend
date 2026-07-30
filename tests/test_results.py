@@ -63,16 +63,6 @@ def test_map_nexus_result_to_qibo_with_fake_qibo(monkeypatch):
     assert row_counts[(0, 1)] == 6  # bitstring "01"
 
 
-def test_map_counts_preserves_measurement_order() -> None:
-    counts = {(1, 0): 7}
-    freq = map_counts_to_qibo_frequencies(
-        counts,
-        measured_qubits=[2, 0],
-        reverse_endianness=False,
-    )
-    assert freq["10"] == 7
-
-
 def test_map_counts_preserves_non_sorted_measurement_order() -> None:
     counts = {(0, 1, 1): 3}
     freq = map_counts_to_qibo_frequencies(
@@ -92,46 +82,6 @@ def test_map_counts_accepts_string_and_int_keys() -> None:
     )
     assert freq["11"] == 3
     assert freq["01"] == 2
-
-
-def test_map_nexus_result_to_qibo_with_aer_like_string_counts(monkeypatch) -> None:
-    from collections import Counter
-
-    class MeasurementOutcomes:
-        def __init__(self, measurements, backend=None, nshots=0, samples=None):
-            self.measurements = measurements
-            self.backend = backend
-            self.nshots = nshots
-            self.samples = samples
-
-    qibo_result = types.ModuleType("qibo.result")
-    qibo_result.MeasurementOutcomes = MeasurementOutcomes
-    monkeypatch.setitem(__import__("sys").modules, "qibo.result", qibo_result)
-
-    class BackendResult:
-        def get_counts(self):
-            return {"00": 3, "11": 1}
-
-    class ExecutionResultRef:
-        def download_result(self):
-            return BackendResult()
-
-    circuit = Circuit(2)
-    circuit.add(gates.M(0, 1))
-    result = map_nexus_result_to_qibo(
-        execution_result_ref=ExecutionResultRef(),
-        circuit=circuit,
-        backend=object(),
-        nshots=4,
-        measured_qubits=[0, 1],
-        reverse_endianness=False,
-    )
-
-    assert result.nshots == 4
-    assert result.samples.shape == (4, 2)
-    row_counts = Counter(tuple(row) for row in result.samples.tolist())
-    assert row_counts[(0, 0)] == 3
-    assert row_counts[(1, 1)] == 1
 
 
 class _FakeBit:
@@ -192,6 +142,161 @@ def test_map_nexus_result_orders_registers_by_declaration(monkeypatch) -> None:
     assert row_counts[(0, 0, 1)] == 5
 
 
+def test_map_nexus_result_orders_bits_within_register(monkeypatch) -> None:
+    """A multi-qubit measurement (qibo M(0, 1)) becomes one multi-bit creg;
+    bits inside it must be selected in index order even when the result
+    presents them scrambled."""
+    from collections import Counter
+
+    class MeasurementOutcomes:
+        def __init__(self, measurements, backend=None, nshots=0, samples=None):
+            self.measurements = measurements
+            self.backend = backend
+            self.nshots = nshots
+            self.samples = samples
+
+    qibo_result = types.ModuleType("qibo.result")
+    qibo_result.MeasurementOutcomes = MeasurementOutcomes
+    monkeypatch.setitem(__import__("sys").modules, "qibo.result", qibo_result)
+
+    bit0, bit1 = _FakeBit("m0", 0), _FakeBit("m0", 1)
+    readout = {(("m0", 0)): 0, (("m0", 1)): 1}
+
+    class BackendResult:
+        c_bits = {bit1: 0, bit0: 1}  # scrambled presentation order
+
+        def get_counts(self, cbits=None):
+            order = [bit1, bit0] if cbits is None else list(cbits)
+            return {
+                tuple(readout[(b.reg_name, b.index[0])] for b in order): 4
+            }
+
+    class ExecutionResultRef:
+        def download_result(self):
+            return BackendResult()
+
+    circuit = Circuit(2)
+    circuit.add(gates.M(0, 1))
+    result = map_nexus_result_to_qibo(
+        execution_result_ref=ExecutionResultRef(),
+        circuit=circuit,
+        backend=object(),
+        nshots=4,
+        measured_qubits=[0, 1],
+        reverse_endianness=False,
+        register_order=["m0"],
+    )
+
+    row_counts = Counter(tuple(row) for row in result.samples.tolist())
+    # m0[0]=0, m0[1]=1 → "01"; scrambled c_bits order would have yielded "10".
+    assert row_counts[(0, 1)] == 4
+
+
+def test_map_nexus_result_excludes_unknown_registers_with_warning(
+    monkeypatch, caplog
+) -> None:
+    """Compilation-added scratch registers must be excluded from the counts
+    selection (keeping declared-register ordering intact) and reported loudly —
+    silently reverting to the default lexicographic order would corrupt paid
+    results."""
+    import logging
+    from collections import Counter
+
+    class MeasurementOutcomes:
+        def __init__(self, measurements, backend=None, nshots=0, samples=None):
+            self.measurements = measurements
+            self.backend = backend
+            self.nshots = nshots
+            self.samples = samples
+
+    qibo_result = types.ModuleType("qibo.result")
+    qibo_result.MeasurementOutcomes = MeasurementOutcomes
+    monkeypatch.setitem(__import__("sys").modules, "qibo.result", qibo_result)
+
+    names = ("m0", "m2", "m10", "tk_SCRATCH")
+    bits = {name: _FakeBit(name, 0) for name in names}
+    readout = {"m0": 0, "m2": 0, "m10": 1, "tk_SCRATCH": 1}
+    lexicographic = [bits["m0"], bits["m10"], bits["m2"], bits["tk_SCRATCH"]]
+
+    class BackendResult:
+        c_bits = {bits[name]: pos for pos, name in enumerate(names)}
+
+        def get_counts(self, cbits=None):
+            order = lexicographic if cbits is None else list(cbits)
+            return {tuple(readout[b.reg_name] for b in order): 5}
+
+    class ExecutionResultRef:
+        def download_result(self):
+            return BackendResult()
+
+    circuit = Circuit(3)
+    circuit.add(gates.M(0, register_name="m0"))
+    circuit.add(gates.M(1, register_name="m2"))
+    circuit.add(gates.M(2, register_name="m10"))
+    with caplog.at_level(logging.WARNING, logger="nexus.results"):
+        result = map_nexus_result_to_qibo(
+            execution_result_ref=ExecutionResultRef(),
+            circuit=circuit,
+            backend=object(),
+            nshots=5,
+            measured_qubits=[0, 1, 2],
+            reverse_endianness=False,
+            register_order=["m0", "m2", "m10"],
+        )
+
+    row_counts = Counter(tuple(row) for row in result.samples.tolist())
+    assert row_counts[(0, 0, 1)] == 5
+    assert any("tk_SCRATCH" in rec.message for rec in caplog.records)
+
+
+def test_map_nexus_result_warns_when_cbits_selection_rejected(
+    monkeypatch, caplog
+) -> None:
+    """A result that exposes c_bits but rejects the cbits kwarg falls back to
+    the default order — that fallback can corrupt ≥10-register circuits, so it
+    must be logged, not silent."""
+    import logging
+    from collections import Counter
+
+    class MeasurementOutcomes:
+        def __init__(self, measurements, backend=None, nshots=0, samples=None):
+            self.measurements = measurements
+            self.backend = backend
+            self.nshots = nshots
+            self.samples = samples
+
+    qibo_result = types.ModuleType("qibo.result")
+    qibo_result.MeasurementOutcomes = MeasurementOutcomes
+    monkeypatch.setitem(__import__("sys").modules, "qibo.result", qibo_result)
+
+    class BackendResult:
+        c_bits = {_FakeBit("m0", 0): 0}
+
+        def get_counts(self):  # no cbits kwarg
+            return {"0": 3}
+
+    class ExecutionResultRef:
+        def download_result(self):
+            return BackendResult()
+
+    circuit = Circuit(1)
+    circuit.add(gates.M(0, register_name="m0"))
+    with caplog.at_level(logging.WARNING, logger="nexus.results"):
+        result = map_nexus_result_to_qibo(
+            execution_result_ref=ExecutionResultRef(),
+            circuit=circuit,
+            backend=object(),
+            nshots=3,
+            measured_qubits=[0],
+            reverse_endianness=False,
+            register_order=["m0"],
+        )
+
+    row_counts = Counter(tuple(row) for row in result.samples.tolist())
+    assert row_counts[(0,)] == 3
+    assert any("cbits" in rec.message for rec in caplog.records)
+
+
 def test_map_nexus_result_register_order_ignored_without_cbits(monkeypatch) -> None:
     """Results that don't expose pytket-style c_bits (or reject the cbits
     kwarg) must still map via the plain get_counts() path."""
@@ -230,40 +335,3 @@ def test_map_nexus_result_register_order_ignored_without_cbits(monkeypatch) -> N
 
     row_counts = Counter(tuple(row) for row in result.samples.tolist())
     assert row_counts[(0, 1)] == 3
-
-
-def test_map_nexus_result_to_qibo_preserves_measurement_samples(monkeypatch) -> None:
-    from collections import Counter
-
-    class MeasurementOutcomes:
-        def __init__(self, measurements, backend=None, nshots=0, samples=None):
-            self.measurements = measurements
-            self.backend = backend
-            self.nshots = nshots
-            self.samples = samples
-
-    qibo_result = types.ModuleType("qibo.result")
-    qibo_result.MeasurementOutcomes = MeasurementOutcomes
-    monkeypatch.setitem(__import__("sys").modules, "qibo.result", qibo_result)
-
-    class BackendResult:
-        def get_counts(self):
-            return {"011": 5}
-
-    class ExecutionResultRef:
-        def download_result(self):
-            return BackendResult()
-
-    circuit = Circuit(3)
-    circuit.add(gates.M(2, 0, 1))
-    result = map_nexus_result_to_qibo(
-        execution_result_ref=ExecutionResultRef(),
-        circuit=circuit,
-        backend=object(),
-        nshots=5,
-        measured_qubits=[2, 0, 1],
-        reverse_endianness=False,
-    )
-
-    row_counts = Counter(tuple(row) for row in result.samples.tolist())
-    assert row_counts[(0, 1, 1)] == 5

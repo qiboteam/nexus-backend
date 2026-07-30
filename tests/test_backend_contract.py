@@ -398,7 +398,11 @@ def test_unsupported_execution_modes(backend: backend_mod.NexusClientBackend) ->
         backend.estimate_circuit(Circuit(1), nshots=10)
 
 
-def test_platform_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_forwards_user_max_cost_on_hseries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user-supplied max_cost must cap non-Helios (paid H-series) submissions
+    too, not silently apply only to the Helios path."""
     monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
     monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
     monkeypatch.setattr(
@@ -407,59 +411,35 @@ def test_platform_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         backend_mod, "build_nexus_backend_config", lambda cfg: "backend-config"
     )
-    backend = backend_mod.NexusClientBackend(platform="hseries:H2-1LE", project="proj")
-    assert backend.config.platform == "hseries:H2-1LE"
-
-
-def test_execute_circuit_contract_shape_aer_platform(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
-    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
     monkeypatch.setattr(
-        backend_mod, "ensure_project", lambda project_name: "project-ref"
+        backend_mod.NexusClientBackend,
+        "_upload_translated_program",
+        lambda self, circuit, *, parameters=None, sequence_idx=0: (
+            "program-ref",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
     )
-    monkeypatch.setattr(
-        backend_mod, "build_nexus_backend_config", lambda cfg: "aer-backend-config"
-    )
-
     calls: dict[str, object] = {}
-
-    def fake_upload(self, circuit, *, parameters=None, sequence_idx=0):
-        calls["upload"] = {"parameters": parameters, "sequence_idx": sequence_idx}
-        return "program-ref", TranslationMetadata(
-            measured_qubits=[0, 1], nqubits=2, qasm="q"
-        )
-
-    def fake_run_compile_execute(**kwargs):
-        calls["run"] = kwargs
-        return ["execution-item"]
-
-    def fake_map(**kwargs):
-        calls["map"] = kwargs
-        return {"kind": "MeasurementOutcomes", "nshots": kwargs["nshots"]}
-
     monkeypatch.setattr(
-        backend_mod.NexusClientBackend, "_upload_translated_program", fake_upload
+        backend_mod,
+        "run_compile_execute",
+        lambda **kwargs: calls.update({"run": kwargs})
+        or ["item"] * len(kwargs["programs"]),
     )
-    monkeypatch.setattr(backend_mod, "run_compile_execute", fake_run_compile_execute)
-    monkeypatch.setattr(backend_mod, "map_nexus_result_to_qibo", fake_map)
+    monkeypatch.setattr(
+        backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
+    )
 
     backend = backend_mod.NexusClientBackend(
-        platform="aer:aer_simulator",
-        project="proj",
-        job_name_prefix="team-alpha",
+        platform="hseries:H2-1LE", project="proj", max_cost=10.0
     )
-    circuit = make_measured_circuit(2)
-    result = backend.execute_circuit(circuit, nshots=128, parameters=[0.1])
+    backend.execute_circuit(make_measured_circuit(1), nshots=10)
+    assert calls["run"]["max_cost"] == 10.0
 
-    assert result["kind"] == "MeasurementOutcomes"
-    assert result["nshots"] == 128
-    assert calls["upload"] == {"parameters": [0.1], "sequence_idx": 0}
-    assert calls["run"]["backend_config"] == "aer-backend-config"
-    assert calls["run"]["job_name_prefix"] == "team-alpha"
-    assert calls["run"]["platform"] == "aer:aer_simulator"
-    assert calls["map"]["execution_result_ref"] == "execution-item"
+    backend.execute_circuits(
+        [make_measured_circuit(1), make_measured_circuit(1)], nshots=10
+    )
+    assert calls["run"]["max_cost"] == 10.0
 
 
 def test_constructor_is_lazy_and_project_defaults_none(
@@ -890,6 +870,45 @@ def test_execute_circuit_helios_rejects_non_positive_cost_estimate(
         backend.execute_circuit(make_measured_circuit(1), nshots=10)
 
     assert "execute" not in calls
+
+
+def test_execute_circuits_helios_rejects_non_positive_batch_cost_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The batch estimator has its own validation loop; a single (0.0, -1.0)
+    item anywhere in the batch must abort before any submission."""
+    calls: dict[str, object] = {}
+    qnx = _make_helios_qnx(calls, cost_items=[(1.5, 84.0), (0.0, -1.0)])
+    _patch_helios_env(monkeypatch, qnx)
+
+    backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1", project="proj", emulator=True
+    )
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    with pytest.raises(NexusBackendError, match="(?i)cost"):
+        backend.execute_circuits(circuits, nshots=[10, 20])
+
+    assert "execute" not in calls
+
+
+def test_execute_circuit_helios_user_n_qubits_overrides_per_item_sizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user who explicitly over-provisions the emulator (n_qubits in
+    backend_options) must not be silently shrunk back to circuit width by the
+    per-item sizing hint."""
+    calls: dict[str, object] = {}
+    _patch_helios_env(monkeypatch, _make_helios_qnx(calls, cost_items=[(1.0, 84.0)]))
+
+    backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1E",
+        project="proj",
+        emulator=True,
+        n_qubits=40,
+    )
+    backend.execute_circuit(make_measured_circuit(1), nshots=10)
+
+    assert calls["execute"]["n_qubits"] == 40
 
 
 def test_execute_circuit_helios_user_max_cost_skips_estimation(

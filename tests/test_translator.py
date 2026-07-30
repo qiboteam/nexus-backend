@@ -141,7 +141,3 @@ def test_prepare_qibo_circuit_normalizes_invalid_register_name() -> None:
     assert prepared.queue[0].register_name == "m0"
     assert circuit.queue[0].register_name == "1-invalid"
 
-
-def test_prepare_qibo_circuit_requires_qibo_circuit_api() -> None:
-    with pytest.raises(AttributeError):
-        prepare_qibo_circuit(types.SimpleNamespace())

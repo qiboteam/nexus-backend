@@ -13,20 +13,34 @@ from nexus.config import (
 )
 
 
-def test_helios_emulator_detection_rejects_syntax_checker() -> None:
-    assert _should_use_helios_emulator("Helios-1SC", None) is False
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Helios-1SC", False),  # syntax checker must never count as emulator
+        ("Helios-1E", True),
+        ("helios-emulator", True),
+        ("Helios-1", False),  # hardware
+    ],
+)
+def test_helios_emulator_detection(name: str, expected: bool) -> None:
+    assert _should_use_helios_emulator(name, None) is expected
 
 
-def test_helios_emulator_detection_accepts_emulator_suffix() -> None:
-    assert _should_use_helios_emulator("Helios-1E", None) is True
-
-
-def test_helios_emulator_detection_accepts_emulator_keyword() -> None:
-    assert _should_use_helios_emulator("helios-emulator", None) is True
-
-
-def test_helios_emulator_detection_hardware_returns_false() -> None:
-    assert _should_use_helios_emulator("Helios-1", None) is False
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_cost": 0.0},
+        {"max_cost": -1.0},
+        {"max_cost": float("nan")},
+        {"max_cost_factor": 0.0},
+        {"max_cost_factor": -0.5},
+    ],
+)
+def test_config_rejects_non_positive_cost_options(kwargs: dict) -> None:
+    """max_cost=0.0 submitted to Helios instantly depletes the job; a zero or
+    negative max_cost_factor turns a valid estimate into the same thing."""
+    with pytest.raises(ValueError, match="max_cost"):
+        NexusBackendConfig(**kwargs)
 
 
 def test_parse_platform_defaults_to_hseries_when_missing_family() -> None:
