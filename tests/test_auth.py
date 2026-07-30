@@ -39,9 +39,7 @@ def test_authenticate_headless_default_does_not_force_login(
     def fail() -> None:
         raise AssertionError("login must not be called")
 
-    _install_fake_qnexus(
-        monkeypatch, login_with_credentials=fail, login=fail
-    )
+    _install_fake_qnexus(monkeypatch, login_with_credentials=fail, login=fail)
 
     assert authenticate(credential_login=None) is None
     assert authenticate(credential_login=False) is None

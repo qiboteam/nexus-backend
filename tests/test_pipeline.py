@@ -434,9 +434,7 @@ def test_estimate_helios_batch_costs_rejects_malformed_results(mutate, match) ->
     mutate(hugr)
     qnx = types.SimpleNamespace(hugr=hugr)
     with pytest.raises(NexusBackendError, match=match):
-        _estimate_helios_costs_batch(
-            qnx=qnx, programs=["p0", "p1"], n_shots=[10, 20]
-        )
+        _estimate_helios_costs_batch(qnx=qnx, programs=["p0", "p1"], n_shots=[10, 20])
 
 
 def test_normalize_nshots_defaults_none_to_1000() -> None:

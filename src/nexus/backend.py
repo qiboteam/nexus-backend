@@ -256,7 +256,9 @@ def _estimate_prepared_compilation(
             "Compile-time HQC estimation is only supported for Quantinuum H2 systems."
         )
     syntax_checker = _resolve_estimate_syntax_checker(backend_config)
-    if syntax_checker is None:  # pragma: no cover - _supports_hqc_estimation guards this
+    if (
+        syntax_checker is None
+    ):  # pragma: no cover - _supports_hqc_estimation guards this
         raise NexusBackendError(
             "Could not derive an H2 syntax-checker target for compile-time HQC estimation."
         )
@@ -680,9 +682,7 @@ class NexusClientBackend(NumpyBackend):
         # When language is None the kwarg is omitted from start_execute_job and
         # qnexus's own default (Language.AUTO) applies.
         self._resolved_language = (
-            None
-            if self.config.platform_family == "helios"
-            else self.config.language
+            None if self.config.platform_family == "helios" else self.config.language
         )
         self._connected = True
 

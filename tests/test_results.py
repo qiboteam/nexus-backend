@@ -247,7 +247,6 @@ def test_map_nexus_result_excludes_unknown_registers_with_warning(
     assert any("tk_SCRATCH" in rec.message for rec in caplog.records)
 
 
-
 def test_map_nexus_result_register_order_ignored_without_cbits(monkeypatch) -> None:
     """Results that don't expose pytket-style c_bits (or reject the cbits
     kwarg) must still map via the plain get_counts() path."""
@@ -310,11 +309,6 @@ def test_normalize_bitstring_rejects_width_overflow() -> None:
         normalize_bitstring(
             key="101", nbits=2, measured_qubits=[0, 1], reverse_endianness=False
         )
-
-
-
-
-
 
 
 def test_ordered_cbits_warns_when_no_declared_register_matches(caplog) -> None:

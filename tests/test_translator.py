@@ -195,7 +195,6 @@ def test_translate_wraps_pytket_parse_failure(monkeypatch: pytest.MonkeyPatch) -
         translate_qibo_to_pytket_for_helios(circuit)
 
 
-
 def test_translate_for_helios_wraps_stripped_export_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
