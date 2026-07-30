@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from qibo.models import Circuit
@@ -11,6 +11,7 @@ from qibo.models import Circuit
 from .errors import NexusBackendError
 
 _QASM_REGISTER_RE = re.compile(r"^[a-z][a-zA-Z0-9_]*$")
+_QASM_CREG_DECL_RE = re.compile(r"^\s*creg\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\[", re.M)
 
 
 @dataclass
@@ -18,6 +19,7 @@ class TranslationMetadata:
     measured_qubits: list[int]
     nqubits: int
     qasm: str
+    measurement_registers: list[str] = field(default_factory=list)
 
 
 def _is_measurement_gate(gate: Any) -> bool:
@@ -190,6 +192,7 @@ def translate_qibo_to_pytket(
         measured_qubits=extract_measurement_qubits(working),
         nqubits=working.nqubits,
         qasm=qasm,
+        measurement_registers=_QASM_CREG_DECL_RE.findall(qasm),
     )
     return pytket_circuit, metadata
 

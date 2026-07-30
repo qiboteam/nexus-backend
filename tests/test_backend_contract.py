@@ -46,7 +46,10 @@ def test_execute_circuit_contract_shape(
     def fake_upload(self, circuit, *, parameters=None, sequence_idx=0):
         calls["upload"] = {"parameters": parameters, "sequence_idx": sequence_idx}
         return "program-ref", TranslationMetadata(
-            measured_qubits=[0, 1], nqubits=2, qasm="q"
+            measured_qubits=[0, 1],
+            nqubits=2,
+            qasm="q",
+            measurement_registers=["register0", "register1"],
         )
 
     def fake_run_compile_execute(**kwargs):
@@ -73,6 +76,7 @@ def test_execute_circuit_contract_shape(
     assert calls["run"]["job_name_prefix"] == "team-alpha"
     assert calls["map"]["execution_result_ref"] == "execution-item"
     assert calls["map"]["measured_qubits"] == [0, 1]
+    assert calls["map"]["register_order"] == ["register0", "register1"]
 
 
 def test_upload_translated_program_uses_job_name_prefix(

@@ -55,9 +55,56 @@ def _download_backend_result(execution_result_ref: Any) -> Any:
     return execution_result_ref
 
 
-def _extract_counts(backend_result: Any) -> dict[Any, int]:
+def _bit_sort_index(bit: Any) -> int:
+    index = getattr(bit, "index", 0)
+    if isinstance(index, (list, tuple)):
+        return int(index[0]) if index else 0
+    return int(index)
+
+
+def _ordered_cbits(backend_result: Any, register_order: list[str] | None) -> Any:
+    """Order pytket classical bits by QASM register declaration order.
+
+    pytket's default get_counts() column order is lexicographic by register
+    name ("m10" < "m2"), which diverges from declaration (measurement) order
+    once auto-numbered register names reach double digits.  Returns None when
+    the result does not expose pytket-style c_bits or contains registers not
+    covered by register_order — callers then keep the backend default order.
+    """
+    if not register_order:
+        return None
+    c_bits = getattr(backend_result, "c_bits", None)
+    if not c_bits:
+        return None
+
+    rank = {name: pos for pos, name in enumerate(register_order)}
+    groups: dict[str, list[Any]] = {}
+    for bit in c_bits:
+        name = getattr(bit, "reg_name", None)
+        if name is None:
+            return None
+        groups.setdefault(str(name), []).append(bit)
+    if any(name not in rank for name in groups):
+        return None
+
+    ordered: list[Any] = []
+    for name in sorted(groups, key=lambda n: rank[n]):
+        ordered.extend(sorted(groups[name], key=_bit_sort_index))
+    return ordered
+
+
+def _extract_counts(
+    backend_result: Any, register_order: list[str] | None = None
+) -> dict[Any, int]:
     if hasattr(backend_result, "get_counts"):
-        counts = backend_result.get_counts()
+        cbits = _ordered_cbits(backend_result, register_order)
+        if cbits is not None:
+            try:
+                counts = backend_result.get_counts(cbits=cbits)
+            except TypeError:
+                counts = backend_result.get_counts()
+        else:
+            counts = backend_result.get_counts()
     elif isinstance(backend_result, dict):
         counts = backend_result
     else:
@@ -104,11 +151,12 @@ def map_nexus_result_to_qibo(
     nshots: int,
     measured_qubits: list[int],
     reverse_endianness: bool = False,
+    register_order: list[str] | None = None,
 ) -> Any:
     """Download and convert a Nexus execution result to a Qibo result object."""
 
     backend_result = _download_backend_result(execution_result_ref)
-    counts = _extract_counts(backend_result)
+    counts = _extract_counts(backend_result, register_order)
     frequencies = map_counts_to_qibo_frequencies(
         counts,
         measured_qubits=measured_qubits,

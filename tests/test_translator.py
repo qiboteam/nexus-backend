@@ -55,6 +55,29 @@ def test_translate_qibo_to_pytket(monkeypatch: pytest.MonkeyPatch) -> None:
     assert metadata.measured_qubits == [2, 0]
 
 
+def test_translate_qibo_to_pytket_records_register_declaration_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Register names must be recorded in QASM creg declaration order (gate
+    order), not sorted — pytket's default bit ordering is lexicographic and
+    diverges from it (e.g. m10 < m2)."""
+
+    pytket_mod = types.ModuleType("pytket")
+    qasm_mod = types.ModuleType("pytket.qasm")
+    qasm_mod.circuit_from_qasm_str = lambda source: {"parsed": source}
+
+    monkeypatch.setitem(__import__("sys").modules, "pytket", pytket_mod)
+    monkeypatch.setitem(__import__("sys").modules, "pytket.qasm", qasm_mod)
+
+    circuit = Circuit(2)
+    circuit.add(gates.M(0, register_name="zz"))
+    circuit.add(gates.M(1, register_name="aa"))
+
+    _, metadata = translate_qibo_to_pytket(circuit)
+
+    assert metadata.measurement_registers == ["zz", "aa"]
+
+
 def test_translate_qibo_to_pytket_for_helios_strips_measurements(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

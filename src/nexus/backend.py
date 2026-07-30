@@ -680,18 +680,23 @@ class NexusClientBackend(NumpyBackend):
         nshots: int,
         metadata: TranslationMetadata,
     ) -> Any:
-        mapper = (
-            map_helios_result_to_qibo
-            if self.config.platform_family == "helios"
-            else map_nexus_result_to_qibo
-        )
-        return mapper(
+        if self.config.platform_family == "helios":
+            return map_helios_result_to_qibo(
+                execution_result_ref=execution_result_ref,
+                circuit=circuit,
+                backend=self,
+                nshots=nshots,
+                measured_qubits=metadata.measured_qubits,
+                reverse_endianness=self.config.reverse_endianness,
+            )
+        return map_nexus_result_to_qibo(
             execution_result_ref=execution_result_ref,
             circuit=circuit,
             backend=self,
             nshots=nshots,
             measured_qubits=metadata.measured_qubits,
             reverse_endianness=self.config.reverse_endianness,
+            register_order=metadata.measurement_registers,
         )
 
     def _assert_supported_execution(self, circuit: Circuit, initial_state: Any) -> None:
