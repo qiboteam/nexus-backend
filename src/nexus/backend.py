@@ -369,8 +369,8 @@ def _validate_helios_cost(cost: float) -> None:
     if cost <= 0:
         raise NexusBackendError(
             f"Helios cost estimation returned a non-positive cost ({cost}). "
-            "The server likely omitted cost data. Pass max_cost explicitly to "
-            "the backend to skip automatic estimation."
+            "The server likely omitted cost data. For execution, pass max_cost "
+            "explicitly to the backend to skip automatic estimation."
         )
 
 
@@ -537,6 +537,7 @@ def _execute_prepared_compilation(
     platform: str,
     job_name_prefix: str | None = None,
     project: Any = None,
+    max_cost: float | None = None,
 ) -> list[Any]:
     return _execute_programs(
         qnx=qnx,
@@ -549,6 +550,7 @@ def _execute_prepared_compilation(
         platform=platform,
         job_name_prefix=job_name_prefix,
         project=project,
+        max_cost=max_cost,
     )
 
 
@@ -564,6 +566,7 @@ def run_compile_execute(
     platform: str,
     job_name_prefix: str | None = None,
     project: Any = None,
+    max_cost: float | None = None,
 ) -> list[Any]:
     """Run compile then execute and return execution result refs."""
 
@@ -590,6 +593,7 @@ def run_compile_execute(
         platform=platform,
         job_name_prefix=job_name_prefix,
         project=project,
+        max_cost=max_cost,
     )
 
 
@@ -615,6 +619,32 @@ class NexusClientBackend(NumpyBackend):
         job_name_prefix: str = "qibo-nexus",
         **backend_options: Any,
     ) -> None:
+        """Create a Nexus-backed Qibo backend.
+
+        Args:
+            platform: Target in ``<family>:<name>`` form, e.g.
+                ``"hseries:H2-1LE"``, ``"helios:Helios-1E"``, ``"aer:aer_simulator"``.
+            project: Nexus project name; resolved lazily on first use.
+            optimisation_level: Nexus compile-job optimisation level (non-Helios).
+            timeout: Seconds to wait for each Nexus job.
+            allow_incomplete: Fetch partial results from incomplete jobs.
+            max_cost: Per-program cost cap in HQCs, forwarded to
+                ``start_execute_job``. On Helios it also skips automatic cost
+                estimation. Batches broadcast the same cap to every program, so
+                total exposure is ``len(circuits) * max_cost``. Must be > 0.
+            max_cost_factor: Headroom multiplier (> 0) applied to automatic
+                Helios cost estimates; ignored when ``max_cost`` is set.
+                Helios per-shot cost is dynamic, so an exact estimate risks a
+                truncated (DEPLETED) run.
+            language: Submission language override for non-Helios targets.
+            credential_login: Force credential-based (True) or token-based
+                (False) qnexus login; default lets qnexus decide.
+            batch_mode: Submit ``execute_circuits`` as one batched job.
+            reverse_endianness: Reverse bit order of returned bitstrings.
+            job_name_prefix: Prefix for Nexus job names.
+            **backend_options: Extra fields forwarded to the qnexus backend
+                config (e.g. ``emulator``, ``n_qubits``, ``attempt_batching``).
+        """
         super().__init__()
         self.name = "nexus"
         _ensure_nexus_dependencies()
@@ -650,6 +680,14 @@ class NexusClientBackend(NumpyBackend):
             f"batch_mode={self.config.batch_mode}"
             ")"
         )
+
+    def _emulator_n_qubits(self, circuit_width: int) -> int:
+        # An explicit user-supplied n_qubits (e.g. deliberate over-provisioning)
+        # takes precedence over per-circuit width for the emulator sizing hint.
+        user_n_qubits = self.config.backend_options.get("n_qubits")
+        if user_n_qubits is not None:
+            return int(user_n_qubits)
+        return int(circuit_width)
 
     def _ensure_connected(self) -> None:
         """Authenticate and resolve project/backend config once on demand."""
@@ -794,7 +832,7 @@ class NexusClientBackend(NumpyBackend):
                 project=self._project_ref,
                 max_cost=max_cost,
                 n_qubits=(
-                    metadata.nqubits
+                    self._emulator_n_qubits(metadata.nqubits)
                     if helios_emulator_requested(self.config)
                     else None
                 ),
@@ -811,6 +849,7 @@ class NexusClientBackend(NumpyBackend):
                 platform=self.config.platform,
                 job_name_prefix=self.config.job_name_prefix,
                 project=self._project_ref,
+                max_cost=self.config.max_cost,
             )
 
         LOGGER.info(
@@ -961,7 +1000,7 @@ class NexusClientBackend(NumpyBackend):
                 project=self._project_ref,
                 max_cost=max_cost,
                 n_qubits=(
-                    [m.nqubits for m in metadata_list]
+                    [self._emulator_n_qubits(m.nqubits) for m in metadata_list]
                     if helios_emulator_requested(self.config)
                     else None
                 ),
@@ -1037,6 +1076,7 @@ class NexusClientBackend(NumpyBackend):
             platform=self.config.platform,
             job_name_prefix=self.config.job_name_prefix,
             project=self._project_ref,
+            max_cost=self.config.max_cost,
         )
 
         if len(execution_items) != len(circuits):

@@ -30,6 +30,22 @@ class NexusBackendConfig:
     backend_options: dict[str, Any] = field(default_factory=dict)
     job_name_prefix: str = "qibo-nexus"
 
+    def __post_init__(self) -> None:
+        # A max_cost of 0.0 submitted to Helios instantly depletes the job, so
+        # neither an explicit non-positive max_cost nor a factor that could
+        # produce one may survive construction.  `not (x > 0)` also catches NaN.
+        if self.max_cost is not None:
+            self.max_cost = float(self.max_cost)
+            if not self.max_cost > 0:
+                raise ValueError(
+                    f"max_cost must be a positive number of HQCs, got {self.max_cost!r}."
+                )
+        self.max_cost_factor = float(self.max_cost_factor)
+        if not self.max_cost_factor > 0:
+            raise ValueError(
+                f"max_cost_factor must be positive, got {self.max_cost_factor!r}."
+            )
+
     @property
     def platform_family(self) -> str:
         return parse_platform(self.platform)[0]

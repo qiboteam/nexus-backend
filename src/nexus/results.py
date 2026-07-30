@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from itertools import repeat
 from typing import Any, Iterable
@@ -10,6 +11,8 @@ import numpy as np
 from qibo.models import Circuit
 
 from .errors import NexusResultMappingError
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _bits_from_key(key: Any) -> list[int]:
@@ -68,8 +71,11 @@ def _ordered_cbits(backend_result: Any, register_order: list[str] | None) -> Any
     pytket's default get_counts() column order is lexicographic by register
     name ("m10" < "m2"), which diverges from declaration (measurement) order
     once auto-numbered register names reach double digits.  Returns None when
-    the result does not expose pytket-style c_bits or contains registers not
-    covered by register_order — callers then keep the backend default order.
+    the result does not expose pytket-style c_bits — callers then keep the
+    backend default order.  Registers not covered by register_order (e.g.
+    scratch registers added during compilation) are excluded from the
+    selection with a warning; only if none of the declared registers survive
+    does the ordering fall back entirely.
     """
     if not register_order:
         return None
@@ -84,11 +90,28 @@ def _ordered_cbits(backend_result: Any, register_order: list[str] | None) -> Any
         if name is None:
             return None
         groups.setdefault(str(name), []).append(bit)
-    if any(name not in rank for name in groups):
+
+    known = [name for name in groups if name in rank]
+    unknown = [name for name in groups if name not in rank]
+    if not known:
+        LOGGER.warning(
+            "None of the result's classical registers %s match the declared "
+            "measurement registers %s; falling back to the backend's default "
+            "bit order, which may not follow measurement order.",
+            sorted(groups),
+            register_order,
+        )
         return None
+    if unknown:
+        LOGGER.warning(
+            "Excluding unexpected classical registers %s from counts; keeping "
+            "declared registers %s in declaration order.",
+            sorted(unknown),
+            register_order,
+        )
 
     ordered: list[Any] = []
-    for name in sorted(groups, key=lambda n: rank[n]):
+    for name in sorted(known, key=lambda n: rank[n]):
         ordered.extend(sorted(groups[name], key=_bit_sort_index))
     return ordered
 
@@ -102,6 +125,11 @@ def _extract_counts(
             try:
                 counts = backend_result.get_counts(cbits=cbits)
             except TypeError:
+                LOGGER.warning(
+                    "Backend result rejected the cbits selection; falling "
+                    "back to the default bit order, which may not follow "
+                    "measurement order."
+                )
                 counts = backend_result.get_counts()
         else:
             counts = backend_result.get_counts()
