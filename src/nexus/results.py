@@ -8,11 +8,22 @@ from itertools import repeat
 from typing import Any, Iterable
 
 import numpy as np
+from qibo import gates
 from qibo.models import Circuit
 
 from .errors import NexusResultMappingError
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _copy_measurements(circuit: Circuit) -> list[Any]:
+    return [
+        gates.M(
+            *gate.init_args,
+            **{**gate.init_kwargs, "register_name": gate.register_name},
+        )
+        for gate in circuit.measurements
+    ]
 
 
 def _bits_from_key(key: Any) -> list[int]:
@@ -162,7 +173,7 @@ def map_nexus_result_to_qibo(
             "qibo is required to build result objects."
         ) from exc
 
-    measurements = list(circuit.measurements)
+    measurements = _copy_measurements(circuit)
     total_shots = int(sum(frequencies.values()))
     effective_nshots = total_shots if total_shots > 0 else int(nshots)
 

@@ -63,6 +63,59 @@ def test_map_nexus_result_to_qibo_with_fake_qibo(monkeypatch):
     assert row_counts[(0, 1)] == 6  # bitstring "01"
 
 
+def test_map_nexus_result_reexecution_keeps_samples_isolated() -> None:
+    from qibo.backends.numpy import NumpyBackend
+
+    class BackendResult:
+        def __init__(self, counts):
+            self.counts = counts
+
+        def get_counts(self):
+            return self.counts
+
+    class ExecutionResultRef:
+        def __init__(self, counts):
+            self.counts = counts
+
+        def download_result(self):
+            return BackendResult(self.counts)
+
+    circuit = Circuit(2)
+    circuit_measurement = circuit.add(gates.M(0, 1))
+    first_backend = NumpyBackend()
+    second_backend = NumpyBackend()
+
+    first = map_nexus_result_to_qibo(
+        execution_result_ref=ExecutionResultRef({(0, 0): 2}),
+        circuit=circuit,
+        backend=first_backend,
+        nshots=2,
+        measured_qubits=[0, 1],
+    )
+    second = map_nexus_result_to_qibo(
+        execution_result_ref=ExecutionResultRef({(1, 1): 3}),
+        circuit=circuit,
+        backend=second_backend,
+        nshots=3,
+        measured_qubits=[0, 1],
+    )
+
+    assert first.backend is first_backend
+    assert second.backend is second_backend
+    assert first.measurements[0] is not circuit.measurements[0]
+    assert second.measurements[0] is not circuit.measurements[0]
+    assert first.measurements[0] is not second.measurements[0]
+    assert not circuit_measurement.has_samples()
+    assert first.samples(registers=True)["register0"].tolist() == [[0, 0]] * 2
+    assert second.samples(registers=True)["register0"].tolist() == [[1, 1]] * 3
+    assert dict(first.frequencies(binary=True, registers=True)["register0"]) == {
+        "00": 2
+    }
+    assert dict(second.frequencies(binary=True, registers=True)["register0"]) == {
+        "11": 3
+    }
+
+
 def test_map_counts_preserves_non_sorted_measurement_order() -> None:
     counts = {(0, 1, 1): 3}
     freq = map_counts_to_qibo_frequencies(

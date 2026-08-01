@@ -141,6 +141,9 @@ def test_map_helios_result_to_qibo_from_register_bitstrings(monkeypatch) -> None
 
     assert result.nshots == 3
     assert result.samples.shape == (3, 2)
+    assert result.measurements[0] is not circuit.measurements[0]
+    assert result.measurements[0].init_args == circuit.measurements[0].init_args
+    assert result.measurements[0].register_name == circuit.measurements[0].register_name
     rows = [tuple(row) for row in result.samples.tolist()]
     assert rows.count((1, 0)) == 2
     assert rows.count((0, 1)) == 1

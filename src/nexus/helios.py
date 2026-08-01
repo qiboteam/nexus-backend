@@ -11,7 +11,7 @@ import numpy as np
 from qibo.models import Circuit
 
 from .errors import NexusBackendError, NexusResultMappingError
-from .results import map_counts_to_qibo_frequencies
+from .results import _copy_measurements, map_counts_to_qibo_frequencies
 from .translation import TranslationMetadata, translate_qibo_to_pytket_for_helios
 
 _MEASUREMENT_REGISTER = "m"
@@ -180,7 +180,7 @@ def map_helios_result_to_qibo(
             "qibo is required to build result objects."
         ) from exc
 
-    measurements = list(circuit.measurements)
+    measurements = _copy_measurements(circuit)
     total_shots = int(sum(frequencies.values()))
     effective_nshots = total_shots if total_shots > 0 else int(nshots)
 
