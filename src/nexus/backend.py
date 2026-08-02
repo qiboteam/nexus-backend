@@ -14,7 +14,11 @@ from qibo.backends import NumpyBackend
 from qibo.models import Circuit
 
 from .auth import authenticate, ensure_project
-from .config import NexusBackendConfig, build_nexus_backend_config
+from .config import (
+    NexusBackendConfig,
+    build_nexus_backend_config,
+    helios_emulator_requested,
+)
 from .errors import (
     NexusBackendError,
     UnsupportedExecutionError,
@@ -71,16 +75,6 @@ def _normalize_batch_nshots(nshots: Any, batch_size: int) -> int | list[int]:
     return int(nshots)
 
 
-def _resolve_language(language: Any) -> Any:
-    if language is not None:
-        return language
-    try:
-        return _import_qnexus().Language.AUTO
-    except Exception:  # pragma: no cover - import environment specific
-        # qnexus execute APIs accept string literals; keep a safe fallback.
-        return "AUTO"
-
-
 def _import_qnexus() -> Any:
     try:
         return import_module("qnexus")
@@ -110,11 +104,8 @@ def _ensure_nexus_dependencies() -> None:
 
 
 def _job_id(job: Any) -> str:
-    for attr in ("id", "job_id", "uid"):
-        value = getattr(job, attr, None)
-        if value is not None:
-            return str(value)
-    return "unknown"
+    value = getattr(job, "id", None)
+    return "unknown" if value is None else str(value)
 
 
 def _utc_stamp() -> str:
@@ -151,15 +142,7 @@ def _wait_for_job(qnx: Any, job: Any, *, timeout: float, stage: str) -> Any:
 def _extract_compiled_program_refs(compile_results: Any) -> list[Any]:
     if not compile_results:
         raise NexusBackendError("Compile job returned no results.")
-    outputs: list[Any] = []
-    for item in compile_results:
-        if hasattr(item, "get_output"):
-            outputs.append(item.get_output())
-        elif hasattr(item, "output"):
-            outputs.append(item.output)
-        else:
-            outputs.append(item)
-    return outputs
+    return [item.get_output() for item in compile_results]
 
 
 def _expand_n_shots(n_shots: int | list[int], program_count: int) -> list[int]:
@@ -273,7 +256,9 @@ def _estimate_prepared_compilation(
             "Compile-time HQC estimation is only supported for Quantinuum H2 systems."
         )
     syntax_checker = _resolve_estimate_syntax_checker(backend_config)
-    if syntax_checker is None:
+    if (
+        syntax_checker is None
+    ):  # pragma: no cover - _supports_hqc_estimation guards this
         raise NexusBackendError(
             "Could not derive an H2 syntax-checker target for compile-time HQC estimation."
         )
@@ -358,6 +343,18 @@ _HELIOS_COST_SYSTEM_NAME = "Helios-1"
 # and only "Helios-1SC" exists as a syntax checker — emulator targets must still use this.
 
 
+def _validate_helios_cost(cost: float) -> None:
+    # qnexus substitutes (0.0, -1.0) when the server omits cost data; any real
+    # Helios program costs at least the 5 HQC base, so a non-positive estimate
+    # would submit max_cost=0.0 and instantly deplete the job.
+    if cost <= 0:
+        raise NexusBackendError(
+            f"Helios cost estimation returned a non-positive cost ({cost}). "
+            "The server likely omitted cost data. For execution, pass max_cost "
+            "explicitly to the backend to skip automatic estimation."
+        )
+
+
 def _estimate_helios_cost(
     *,
     qnx: Any,
@@ -385,11 +382,13 @@ def _estimate_helios_cost(
             or items[0][0] is None
         ):
             raise ValueError(f"unexpected result shape: {items!r}")
-        return float(items[0][0])
+        cost = float(items[0][0])
     except (TypeError, ValueError) as exc:
         raise NexusBackendError(
             f"Invalid Helios cost estimate returned: {results!r}"
         ) from exc
+    _validate_helios_cost(cost)
+    return cost
 
 
 def _estimate_helios_costs_batch(
@@ -428,11 +427,13 @@ def _estimate_helios_costs_batch(
                 f"Invalid Helios cost estimate at index {idx}: {item!r}"
             )
         try:
-            costs.append(float(item[0]))
+            cost = float(item[0])
         except (TypeError, ValueError) as exc:
             raise NexusBackendError(
                 f"Invalid Helios cost estimate at index {idx}: {item!r}"
             ) from exc
+        _validate_helios_cost(cost)
+        costs.append(cost)
     return costs
 
 
@@ -449,6 +450,7 @@ def _execute_programs(
     job_name_prefix: str | None = None,
     project: Any = None,
     max_cost: float | list[float] | None = None,
+    n_qubits: int | list[int] | None = None,
 ) -> list[Any]:
     execute_name = _job_name(job_name_prefix, "execute", platform)
 
@@ -464,6 +466,8 @@ def _execute_programs(
             execute_kwargs["language"] = language
         if max_cost is not None:
             execute_kwargs["max_cost"] = max_cost
+        if n_qubits is not None:
+            execute_kwargs["n_qubits"] = n_qubits
         execute_job = qnx.start_execute_job(**execute_kwargs)
     except Exception as exc:  # noqa: BLE001
         raise NexusBackendError(f"Failed to submit execute job: {exc}") from exc
@@ -514,6 +518,7 @@ def _execute_prepared_compilation(
     platform: str,
     job_name_prefix: str | None = None,
     project: Any = None,
+    max_cost: float | None = None,
 ) -> list[Any]:
     return _execute_programs(
         qnx=qnx,
@@ -526,6 +531,7 @@ def _execute_prepared_compilation(
         platform=platform,
         job_name_prefix=job_name_prefix,
         project=project,
+        max_cost=max_cost,
     )
 
 
@@ -541,6 +547,7 @@ def run_compile_execute(
     platform: str,
     job_name_prefix: str | None = None,
     project: Any = None,
+    max_cost: float | None = None,
 ) -> list[Any]:
     """Run compile then execute and return execution result refs."""
 
@@ -567,6 +574,7 @@ def run_compile_execute(
         platform=platform,
         job_name_prefix=job_name_prefix,
         project=project,
+        max_cost=max_cost,
     )
 
 
@@ -583,6 +591,8 @@ class NexusClientBackend(NumpyBackend):
         optimisation_level: int = 2,
         timeout: float = 1800.0,
         allow_incomplete: bool = False,
+        max_cost: float | None = None,
+        max_cost_factor: float = 1.2,
         language: Any = None,
         credential_login: bool | None = None,
         batch_mode: bool = True,
@@ -590,6 +600,32 @@ class NexusClientBackend(NumpyBackend):
         job_name_prefix: str = "qibo-nexus",
         **backend_options: Any,
     ) -> None:
+        """Create a Nexus-backed Qibo backend.
+
+        Args:
+            platform: Target in ``<family>:<name>`` form, e.g.
+                ``"hseries:H2-1LE"``, ``"helios:Helios-1E"``, ``"aer:aer_simulator"``.
+            project: Nexus project name; resolved lazily on first use.
+            optimisation_level: Nexus compile-job optimisation level (non-Helios).
+            timeout: Seconds to wait for each Nexus job.
+            allow_incomplete: Fetch partial results from incomplete jobs.
+            max_cost: Per-program cost cap in HQCs, forwarded to
+                ``start_execute_job``. On Helios it also skips automatic cost
+                estimation. Batches broadcast the same cap to every program, so
+                total exposure is ``len(circuits) * max_cost``. Must be > 0.
+            max_cost_factor: Headroom multiplier (> 0) applied to automatic
+                Helios cost estimates; ignored when ``max_cost`` is set.
+                Helios per-shot cost is dynamic, so an exact estimate risks a
+                truncated (DEPLETED) run.
+            language: Submission language override for non-Helios targets.
+            credential_login: Force credential-based (True) or token-based
+                (False) qnexus login; default lets qnexus decide.
+            batch_mode: Submit ``execute_circuits`` as one batched job.
+            reverse_endianness: Reverse bit order of returned bitstrings.
+            job_name_prefix: Prefix for Nexus job names.
+            **backend_options: Extra fields forwarded to the qnexus backend
+                config (e.g. ``emulator``, ``n_qubits``, ``attempt_batching``).
+        """
         super().__init__()
         self.name = "nexus"
         _ensure_nexus_dependencies()
@@ -601,6 +637,8 @@ class NexusClientBackend(NumpyBackend):
             optimisation_level=optimisation_level,
             timeout=timeout,
             allow_incomplete=allow_incomplete,
+            max_cost=max_cost,
+            max_cost_factor=max_cost_factor,
             language=language,
             credential_login=credential_login,
             batch_mode=batch_mode,
@@ -624,6 +662,14 @@ class NexusClientBackend(NumpyBackend):
             ")"
         )
 
+    def _emulator_n_qubits(self, circuit_width: int) -> int:
+        # An explicit user-supplied n_qubits (e.g. deliberate over-provisioning)
+        # takes precedence over per-circuit width for the emulator sizing hint.
+        user_n_qubits = self.config.backend_options.get("n_qubits")
+        if user_n_qubits is not None:
+            return int(user_n_qubits)
+        return int(circuit_width)
+
     def _ensure_connected(self) -> None:
         """Authenticate and resolve project/backend config once on demand."""
         if self._connected:
@@ -632,25 +678,13 @@ class NexusClientBackend(NumpyBackend):
             credential_login=self.config.credential_login,
         )
         self._project_ref = ensure_project(self.config.project)
-        if self.config.platform_family == "helios":
-            self._backend_config = None
-            self._resolved_language = None
-        else:
-            self._backend_config = build_nexus_backend_config(self.config)
-            self._resolved_language = _resolve_language(self.config.language)
-        self._connected = True
-
-    def _build_execution_backend_config(
-        self,
-        *,
-        nqubits: int | None = None,
-    ) -> Any:
-        if self.config.platform_family != "helios":
-            return self._backend_config
-        return build_nexus_backend_config(
-            self.config,
-            n_qubits=nqubits,
+        self._backend_config = build_nexus_backend_config(self.config)
+        # When language is None the kwarg is omitted from start_execute_job and
+        # qnexus's own default (Language.AUTO) applies.
+        self._resolved_language = (
+            None if self.config.platform_family == "helios" else self.config.language
         )
+        self._connected = True
 
     def _map_execution_result(
         self,
@@ -660,18 +694,23 @@ class NexusClientBackend(NumpyBackend):
         nshots: int,
         metadata: TranslationMetadata,
     ) -> Any:
-        mapper = (
-            map_helios_result_to_qibo
-            if self.config.platform_family == "helios"
-            else map_nexus_result_to_qibo
-        )
-        return mapper(
+        if self.config.platform_family == "helios":
+            return map_helios_result_to_qibo(
+                execution_result_ref=execution_result_ref,
+                circuit=circuit,
+                backend=self,
+                nshots=nshots,
+                measured_qubits=metadata.measured_qubits,
+                reverse_endianness=self.config.reverse_endianness,
+            )
+        return map_nexus_result_to_qibo(
             execution_result_ref=execution_result_ref,
             circuit=circuit,
             backend=self,
             nshots=nshots,
             measured_qubits=metadata.measured_qubits,
             reverse_endianness=self.config.reverse_endianness,
+            register_order=metadata.measurement_registers,
         )
 
     def _assert_supported_execution(self, circuit: Circuit, initial_state: Any) -> None:
@@ -752,20 +791,21 @@ class NexusClientBackend(NumpyBackend):
 
         if self.config.platform_family == "helios":
             qnx = _import_qnexus()
-            max_cost = _estimate_helios_cost(
-                qnx=qnx,
-                program=program_ref,
-                nshots=shots,
-                project=self._project_ref,
-            )
-            backend_config = self._build_execution_backend_config(
-                nqubits=metadata.nqubits,
-            )
+            if self.config.max_cost is not None:
+                max_cost = float(self.config.max_cost)
+            else:
+                estimated = _estimate_helios_cost(
+                    qnx=qnx,
+                    program=program_ref,
+                    nshots=shots,
+                    project=self._project_ref,
+                )
+                max_cost = estimated * self.config.max_cost_factor
             execution_items = _execute_programs(
                 qnx=qnx,
                 programs=[program_ref],
                 n_shots=shots,
-                backend_config=backend_config,
+                backend_config=self._backend_config,
                 timeout=self.config.timeout,
                 allow_incomplete=self.config.allow_incomplete,
                 language=None,
@@ -773,6 +813,11 @@ class NexusClientBackend(NumpyBackend):
                 job_name_prefix=self.config.job_name_prefix,
                 project=self._project_ref,
                 max_cost=max_cost,
+                n_qubits=(
+                    self._emulator_n_qubits(metadata.nqubits)
+                    if helios_emulator_requested(self.config)
+                    else None
+                ),
             )
         else:
             execution_items = run_compile_execute(
@@ -786,6 +831,7 @@ class NexusClientBackend(NumpyBackend):
                 platform=self.config.platform,
                 job_name_prefix=self.config.job_name_prefix,
                 project=self._project_ref,
+                max_cost=self.config.max_cost,
             )
 
         LOGGER.info(
@@ -907,29 +953,37 @@ class NexusClientBackend(NumpyBackend):
                 program_refs.append(program_ref)
                 metadata_list.append(metadata)
 
-            costs = _estimate_helios_costs_batch(
-                qnx=qnx,
-                programs=program_refs,
-                n_shots=shot_values,
-                project=self._project_ref,
-            )
-
-            backend_config = self._build_execution_backend_config(
-                nqubits=max(m.nqubits for m in metadata_list),
-            )
+            max_cost: float | list[float]
+            if self.config.max_cost is not None:
+                # Scalar user max_cost is forwarded as-is; qnexus broadcasts it
+                # to every program in the job.
+                max_cost = float(self.config.max_cost)
+            else:
+                costs = _estimate_helios_costs_batch(
+                    qnx=qnx,
+                    programs=program_refs,
+                    n_shots=shot_values,
+                    project=self._project_ref,
+                )
+                max_cost = [float(c) * self.config.max_cost_factor for c in costs]
 
             execution_items = _execute_programs(
                 qnx=qnx,
                 programs=program_refs,
                 n_shots=shot_values,
-                backend_config=backend_config,
+                backend_config=self._backend_config,
                 timeout=self.config.timeout,
                 allow_incomplete=self.config.allow_incomplete,
                 language=None,
                 platform=self.config.platform,
                 job_name_prefix=self.config.job_name_prefix,
                 project=self._project_ref,
-                max_cost=[float(c) for c in costs],
+                max_cost=max_cost,
+                n_qubits=(
+                    [self._emulator_n_qubits(m.nqubits) for m in metadata_list]
+                    if helios_emulator_requested(self.config)
+                    else None
+                ),
             )
 
             if len(execution_items) != len(circuits):
@@ -1002,6 +1056,7 @@ class NexusClientBackend(NumpyBackend):
             platform=self.config.platform,
             job_name_prefix=self.config.job_name_prefix,
             project=self._project_ref,
+            max_cost=self.config.max_cost,
         )
 
         if len(execution_items) != len(circuits):

@@ -2,21 +2,33 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from itertools import repeat
 from typing import Any, Iterable
 
 import numpy as np
+from qibo import gates
 from qibo.models import Circuit
 
 from .errors import NexusResultMappingError
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _copy_measurements(circuit: Circuit) -> list[Any]:
+    return [
+        gates.M(
+            *gate.init_args,
+            **{**gate.init_kwargs, "register_name": gate.register_name},
+        )
+        for gate in circuit.measurements
+    ]
 
 
 def _bits_from_key(key: Any) -> list[int]:
     if isinstance(key, str):
         return [int(ch) for ch in key.strip() if ch in {"0", "1"}]
-    if isinstance(key, int):
-        return [int(ch) for ch in bin(key)[2:]]
     if isinstance(key, Iterable):
         return [int(x) for x in key]
     raise NexusResultMappingError(f"Unsupported count key type: {type(key)}")
@@ -32,8 +44,6 @@ def normalize_bitstring(
     """Normalize backend count keys into Qibo-style binary strings."""
 
     bits = _bits_from_key(key)
-    if len(bits) < nbits:
-        bits = [0] * (nbits - len(bits)) + bits
     if len(bits) != nbits:
         raise NexusResultMappingError(
             f"Count key width mismatch. Expected {nbits}, received {len(bits)} for key={key!r}."
@@ -49,25 +59,65 @@ def normalize_bitstring(
     return "".join(str(bit) for bit in bits)
 
 
-def _download_backend_result(execution_result_ref: Any) -> Any:
-    if hasattr(execution_result_ref, "download_result"):
-        return execution_result_ref.download_result()
-    return execution_result_ref
+def _bit_sort_index(bit: Any) -> int:
+    return int(bit.index[0])
 
 
-def _extract_counts(backend_result: Any) -> dict[Any, int]:
-    if hasattr(backend_result, "get_counts"):
-        counts = backend_result.get_counts()
-    elif isinstance(backend_result, dict):
-        counts = backend_result
-    else:
-        raise NexusResultMappingError(
-            f"Unsupported backend result type '{type(backend_result)}'."
+def _ordered_cbits(backend_result: Any, register_order: list[str] | None) -> Any:
+    """Order pytket classical bits by QASM register declaration order.
+
+    pytket's default get_counts() column order is lexicographic by register
+    name ("m10" < "m2"), which diverges from declaration (measurement) order
+    once auto-numbered register names reach double digits.  Returns None when
+    the result does not expose pytket-style c_bits — callers then keep the
+    backend default order.  Registers not covered by register_order (e.g.
+    scratch registers added during compilation) are excluded from the
+    selection with a warning; only if none of the declared registers survive
+    does the ordering fall back entirely.
+    """
+    if not register_order:
+        return None
+    c_bits = getattr(backend_result, "c_bits", None)
+    if not c_bits:
+        return None
+
+    rank = {name: pos for pos, name in enumerate(register_order)}
+    groups: dict[str, list[Any]] = {}
+    for bit in c_bits:
+        groups.setdefault(str(bit.reg_name), []).append(bit)
+
+    known = [name for name in groups if name in rank]
+    unknown = [name for name in groups if name not in rank]
+    if not known:
+        LOGGER.warning(
+            "None of the result's classical registers %s match the declared "
+            "measurement registers %s; falling back to the backend's default "
+            "bit order, which may not follow measurement order.",
+            sorted(groups),
+            register_order,
+        )
+        return None
+    if unknown:
+        LOGGER.warning(
+            "Excluding unexpected classical registers %s from counts; keeping "
+            "declared registers %s in declaration order.",
+            sorted(unknown),
+            register_order,
         )
 
-    if not isinstance(counts, dict):
-        raise NexusResultMappingError("Nexus get_counts() did not return a dictionary.")
-    return counts
+    ordered: list[Any] = []
+    for name in sorted(known, key=lambda n: rank[n]):
+        ordered.extend(sorted(groups[name], key=_bit_sort_index))
+    return ordered
+
+
+def _extract_counts(
+    backend_result: Any, register_order: list[str] | None = None
+) -> dict[Any, int]:
+    cbits = _ordered_cbits(backend_result, register_order)
+    if cbits is not None:
+        return backend_result.get_counts(cbits=cbits)
+    return backend_result.get_counts()
 
 
 def map_counts_to_qibo_frequencies(
@@ -104,11 +154,12 @@ def map_nexus_result_to_qibo(
     nshots: int,
     measured_qubits: list[int],
     reverse_endianness: bool = False,
+    register_order: list[str] | None = None,
 ) -> Any:
     """Download and convert a Nexus execution result to a Qibo result object."""
 
-    backend_result = _download_backend_result(execution_result_ref)
-    counts = _extract_counts(backend_result)
+    backend_result = execution_result_ref.download_result()
+    counts = _extract_counts(backend_result, register_order)
     frequencies = map_counts_to_qibo_frequencies(
         counts,
         measured_qubits=measured_qubits,
@@ -122,7 +173,7 @@ def map_nexus_result_to_qibo(
             "qibo is required to build result objects."
         ) from exc
 
-    measurements = list(circuit.measurements)
+    measurements = _copy_measurements(circuit)
     total_shots = int(sum(frequencies.values()))
     effective_nshots = total_shots if total_shots > 0 else int(nshots)
 

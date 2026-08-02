@@ -32,3 +32,11 @@ def test_set_backend_nexus(monkeypatch):
     set_backend("nexus", platform="hseries:H2-1LE")
     assert isinstance(get_backend(), NexusClientBackend)
     assert get_backend().name == "nexus"
+
+
+def test_meta_backend_list_available():
+    assert MetaBackend().list_available() == {
+        "hseries": True,
+        "helios": True,
+        "aer": True,
+    }

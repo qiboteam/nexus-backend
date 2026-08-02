@@ -8,24 +8,39 @@ from nexus.config import (
     NexusBackendConfig,
     _should_use_helios_emulator,
     build_nexus_backend_config,
+    helios_emulator_requested,
     parse_platform,
 )
 
 
-def test_helios_emulator_detection_rejects_syntax_checker() -> None:
-    assert _should_use_helios_emulator("Helios-1SC", None) is False
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Helios-1SC", False),  # syntax checker must never count as emulator
+        ("Helios-1E", True),
+        ("helios-emulator", True),
+        ("Helios-1", False),  # hardware
+    ],
+)
+def test_helios_emulator_detection(name: str, expected: bool) -> None:
+    assert _should_use_helios_emulator(name, None) is expected
 
 
-def test_helios_emulator_detection_accepts_emulator_suffix() -> None:
-    assert _should_use_helios_emulator("Helios-1E", None) is True
-
-
-def test_helios_emulator_detection_accepts_emulator_keyword() -> None:
-    assert _should_use_helios_emulator("helios-emulator", None) is True
-
-
-def test_helios_emulator_detection_hardware_returns_false() -> None:
-    assert _should_use_helios_emulator("Helios-1", None) is False
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_cost": 0.0},
+        {"max_cost": -1.0},
+        {"max_cost": float("nan")},
+        {"max_cost_factor": 0.0},
+        {"max_cost_factor": -0.5},
+    ],
+)
+def test_config_rejects_non_positive_cost_options(kwargs: dict) -> None:
+    """max_cost=0.0 submitted to Helios instantly depletes the job; a zero or
+    negative max_cost_factor turns a valid estimate into the same thing."""
+    with pytest.raises(ValueError, match="max_cost"):
+        NexusBackendConfig(**kwargs)
 
 
 def test_parse_platform_defaults_to_hseries_when_missing_family() -> None:
@@ -60,66 +75,94 @@ def test_build_hseries_config(monkeypatch: pytest.MonkeyPatch) -> None:
     assert concrete.device_name == "H2-1LE"
 
 
-def test_build_helios_emulator_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    class HeliosConfig:
-        def __init__(self, *, hardware_name: str, **kwargs):
-            self.kind = "hardware"
-            self.hardware_name = hardware_name
-            self.kwargs = kwargs
+def _install_helios_models(
+    monkeypatch: pytest.MonkeyPatch, *, helios_config, helios_emulator_config
+) -> None:
+    models_mod = types.ModuleType("qnexus.models")
+    models_mod.HeliosConfig = helios_config
+    models_mod.HeliosEmulatorConfig = helios_emulator_config
+    qnx_mod = types.ModuleType("qnexus")
+    qnx_mod.models = models_mod
+    sys_modules = __import__("sys").modules
+    monkeypatch.setitem(sys_modules, "qnexus", qnx_mod)
+    monkeypatch.setitem(sys_modules, "qnexus.models", models_mod)
 
-    class HeliosEmulatorConfig:
-        def __init__(self, *, hardware_name: str, **kwargs):
-            self.kind = "emulator"
-            self.hardware_name = hardware_name
-            self.kwargs = kwargs
 
-    fake_qnx = types.SimpleNamespace(
-        QuantinuumConfig=object,
-        HeliosConfig=HeliosConfig,
-        HeliosEmulatorConfig=HeliosEmulatorConfig,
+class _HeliosEmulatorConfig:
+    def __init__(self, *, simulator: str = "statevector"):
+        self.simulator = simulator
+
+
+class _HeliosConfig:
+    def __init__(self, *, system_name: str, emulator_config=None):
+        self.system_name = system_name
+        self.emulator_config = emulator_config
+
+
+def test_build_helios_hardware_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_helios_models(
+        monkeypatch,
+        helios_config=_HeliosConfig,
+        helios_emulator_config=_HeliosEmulatorConfig,
     )
-    monkeypatch.setitem(__import__("sys").modules, "qnexus", fake_qnx)
+
+    cfg = NexusBackendConfig(platform="helios:Helios-1")
+    concrete = build_nexus_backend_config(cfg)
+
+    assert concrete.system_name == "Helios-1"
+    assert concrete.emulator_config is None
+
+
+def test_build_helios_config_forced_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """emulator=True in backend_options must attach an emulator config even for
+    a hardware-named target."""
+    _install_helios_models(
+        monkeypatch,
+        helios_config=_HeliosConfig,
+        helios_emulator_config=_HeliosEmulatorConfig,
+    )
 
     cfg = NexusBackendConfig(
         platform="helios:Helios-1", backend_options={"emulator": True}
     )
     concrete = build_nexus_backend_config(cfg)
-    assert concrete.kind == "emulator"
-    assert concrete.hardware_name == "Helios-1"
+
+    assert concrete.system_name == "Helios-1"
+    assert isinstance(concrete.emulator_config, _HeliosEmulatorConfig)
 
 
 def test_build_helios_modern_config_uses_emulator_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """n_qubits sizes the HeliosEmulatorConfig; per-program max_cost is now
-    passed via qnx.start_execute_job (not the backend_config), so it does not
-    appear here."""
+    """Emulator sizing and per-program max_cost are now passed via
+    qnx.start_execute_job (n_qubits/max_cost per-item kwargs), so neither is
+    auto-injected into the deprecated HeliosEmulatorConfig fields."""
 
-    class HeliosEmulatorConfig:
-        def __init__(self, *, n_qubits: int, simulator: str):
-            self.n_qubits = n_qubits
-            self.simulator = simulator
-
-    class HeliosConfig:
-        def __init__(self, *, system_name: str, emulator_config=None):
-            self.system_name = system_name
-            self.emulator_config = emulator_config
-
-    fake_qnx = types.SimpleNamespace(
-        QuantinuumConfig=object,
-        HeliosConfig=HeliosConfig,
-        HeliosEmulatorConfig=HeliosEmulatorConfig,
+    _install_helios_models(
+        monkeypatch,
+        helios_config=_HeliosConfig,
+        helios_emulator_config=_HeliosEmulatorConfig,
     )
-    monkeypatch.setitem(__import__("sys").modules, "qnexus", fake_qnx)
 
     cfg = NexusBackendConfig(
         platform="helios:Helios-1E",
         backend_options={"simulator": "statevector", "emulator": True},
     )
-    concrete = build_nexus_backend_config(cfg, n_qubits=12)
+    concrete = build_nexus_backend_config(cfg)
     assert concrete.system_name == "Helios-1E"
-    assert concrete.emulator_config.n_qubits == 12
     assert concrete.emulator_config.simulator == "statevector"
+    assert not hasattr(concrete.emulator_config, "n_qubits")
+
+
+def test_helios_emulator_requested_reflects_platform_and_force_flag() -> None:
+    assert helios_emulator_requested(NexusBackendConfig(platform="helios:Helios-1E"))
+    assert not helios_emulator_requested(NexusBackendConfig(platform="helios:Helios-1"))
+    assert helios_emulator_requested(
+        NexusBackendConfig(
+            platform="helios:Helios-1", backend_options={"emulator": True}
+        )
+    )
+    assert not helios_emulator_requested(NexusBackendConfig(platform="hseries:H2-1LE"))
 
 
 def test_build_helios_emulator_config_ignores_helios_config_kwargs(
@@ -147,12 +190,11 @@ def test_build_helios_emulator_config_ignores_helios_config_kwargs(
             self.attempt_batching = attempt_batching
             self.max_batch_cost = max_batch_cost
 
-    fake_qnx = types.SimpleNamespace(
-        QuantinuumConfig=object,
-        HeliosConfig=HeliosConfig,
-        HeliosEmulatorConfig=HeliosEmulatorConfig,
+    _install_helios_models(
+        monkeypatch,
+        helios_config=HeliosConfig,
+        helios_emulator_config=HeliosEmulatorConfig,
     )
-    monkeypatch.setitem(__import__("sys").modules, "qnexus", fake_qnx)
 
     cfg = NexusBackendConfig(
         platform="helios:Helios-1E",
@@ -189,3 +231,14 @@ def test_build_aer_config(monkeypatch: pytest.MonkeyPatch) -> None:
     concrete = build_nexus_backend_config(cfg)
     assert concrete.kwargs["seed_simulator"] == 11
     assert concrete.kwargs["method"] == "statevector"
+
+
+def test_platform_name_property() -> None:
+    assert NexusBackendConfig(platform="hseries:H2-1LE").platform_name == "H2-1LE"
+
+
+def test_parse_platform_rejects_blank_family_or_name() -> None:
+    with pytest.raises(ValueError, match="Expected '<family>:<name>'"):
+        parse_platform("helios: ")
+    with pytest.raises(ValueError, match="Expected '<family>:<name>'"):
+        parse_platform(" :Helios-1")

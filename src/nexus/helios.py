@@ -5,13 +5,13 @@ from __future__ import annotations
 import linecache
 from collections import Counter
 from itertools import repeat
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 from qibo.models import Circuit
 
 from .errors import NexusBackendError, NexusResultMappingError
-from .results import map_counts_to_qibo_frequencies
+from .results import _copy_measurements, map_counts_to_qibo_frequencies
 from .translation import TranslationMetadata, translate_qibo_to_pytket_for_helios
 
 _MEASUREMENT_REGISTER = "m"
@@ -134,92 +134,24 @@ def build_helios_hugr_package(
         ) from exc
 
 
-def _to_bit(value: Any) -> str:
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, int):
-        if value in {0, 1}:
-            return str(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"0", "1"}:
-            return normalized
-        if normalized in {"true", "false"}:
-            return "1" if normalized == "true" else "0"
-    raise NexusResultMappingError(f"Unsupported Helios result value: {value!r}")
-
-
-def _extract_named_results(shot: Any) -> dict[str, Any]:
-    if isinstance(shot, dict):
-        return {str(k): v for k, v in shot.items()}
-
-    if hasattr(shot, "as_dict"):
-        data = shot.as_dict()
-        if isinstance(data, dict):
-            return {str(k): v for k, v in data.items()}
-
-    if hasattr(shot, "results"):
-        shot = shot.results
-
-    values: dict[str, Any] = {}
-    if isinstance(shot, Iterable) and not isinstance(shot, (str, bytes)):
-        for item in shot:
-            if isinstance(item, tuple) and len(item) == 2:
-                tag, value = item
-            else:
-                tag = getattr(item, "tag", None)
-                if tag is None:
-                    tag = getattr(item, "name", None)
-                if tag is None:
-                    tag = getattr(item, "key", None)
-                value = getattr(item, "value", None)
-            if tag is None:
-                raise NexusResultMappingError(
-                    f"Unsupported Helios shot entry: {item!r}"
-                )
-            values[str(tag)] = value
-        return values
-
-    raise NexusResultMappingError(f"Unsupported Helios shot type: {type(shot)}")
-
-
-def _extract_helios_counts(backend_result: Any, measured_count: int) -> Counter[str]:
-    if hasattr(backend_result, "register_bitstrings"):
-        try:
-            register_bitstrings = backend_result.register_bitstrings()
-        except Exception:
-            register_bitstrings = None
-        if isinstance(register_bitstrings, dict):
-            values = register_bitstrings.get(_MEASUREMENT_REGISTER)
-            if values is not None:
-                return Counter(str(bitstring) for bitstring in values)
-
-    shots = getattr(backend_result, "shots", None)
-    if shots is None:
-        shots = getattr(backend_result, "results", None)
-    if (
-        shots is None
-        and isinstance(backend_result, Iterable)
-        and not isinstance(backend_result, (str, bytes, dict))
-    ):
-        shots = backend_result
-    if shots is None:
+def _extract_helios_counts(backend_result: Any) -> Counter[str]:
+    # QsysResult.register_bitstrings() collates the entrypoint's
+    # "m[idx]"-tagged results into per-shot bitstrings with index 0 leftmost,
+    # matching measured-qubit serialization order.  Bitstring width is
+    # validated downstream by normalize_bitstring.
+    try:
+        register_bitstrings = backend_result.register_bitstrings()
+    except Exception as exc:
         raise NexusResultMappingError(
-            f"Unsupported Helios backend result type '{type(backend_result)}'."
+            f"Unsupported Helios backend result type '{type(backend_result)}': {exc}"
+        ) from exc
+    values = register_bitstrings.get(_MEASUREMENT_REGISTER)
+    if values is None:
+        raise NexusResultMappingError(
+            f"Helios result has no '{_MEASUREMENT_REGISTER}' register; "
+            f"got registers {sorted(register_bitstrings)}."
         )
-
-    counts: Counter[str] = Counter()
-    expected_tags = [f"{_MEASUREMENT_REGISTER}[{idx}]" for idx in range(measured_count)]
-    for shot in shots:
-        named = _extract_named_results(shot)
-        try:
-            bitstring = "".join(_to_bit(named[tag]) for tag in expected_tags)
-        except KeyError as exc:
-            raise NexusResultMappingError(
-                f"Missing Helios measurement tag '{exc.args[0]}' in shot result."
-            ) from exc
-        counts[bitstring] += 1
-    return counts
+    return Counter(str(bitstring) for bitstring in values)
 
 
 def map_helios_result_to_qibo(
@@ -233,12 +165,8 @@ def map_helios_result_to_qibo(
 ) -> Any:
     """Download and convert a Helios execution result to a Qibo result object."""
 
-    backend_result = (
-        execution_result_ref.download_result()
-        if hasattr(execution_result_ref, "download_result")
-        else execution_result_ref
-    )
-    counts = _extract_helios_counts(backend_result, len(measured_qubits))
+    backend_result = execution_result_ref.download_result()
+    counts = _extract_helios_counts(backend_result)
     frequencies = map_counts_to_qibo_frequencies(
         counts,
         measured_qubits=measured_qubits,
@@ -252,7 +180,7 @@ def map_helios_result_to_qibo(
             "qibo is required to build result objects."
         ) from exc
 
-    measurements = list(circuit.measurements)
+    measurements = _copy_measurements(circuit)
     total_shots = int(sum(frequencies.values()))
     effective_nshots = total_shots if total_shots > 0 else int(nshots)
 
