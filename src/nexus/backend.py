@@ -596,6 +596,7 @@ class NexusClientBackend(NumpyBackend):
         language: Any = None,
         credential_login: bool | None = None,
         batch_mode: bool = True,
+        blocking: bool = True,
         reverse_endianness: bool = False,
         job_name_prefix: str = "qibo-nexus",
         **backend_options: Any,
@@ -621,6 +622,11 @@ class NexusClientBackend(NumpyBackend):
             credential_login: Force credential-based (True) or token-based
                 (False) qnexus login; default lets qnexus decide.
             batch_mode: Submit ``execute_circuits`` as one batched job.
+            blocking: Default execution mode. When ``False``,
+                ``execute_circuit``/``execute_circuits`` (and therefore the
+                ``circuit(...)`` spelling) return a :class:`~nexus.job.NexusJob`
+                handle instead of waiting for results. Per-call
+                ``blocking=True/False`` overrides this default.
             reverse_endianness: Reverse bit order of returned bitstrings.
             job_name_prefix: Prefix for Nexus job names.
             **backend_options: Extra fields forwarded to the qnexus backend
@@ -642,6 +648,7 @@ class NexusClientBackend(NumpyBackend):
             language=language,
             credential_login=credential_login,
             batch_mode=batch_mode,
+            blocking=blocking,
             reverse_endianness=reverse_endianness,
             backend_options=backend_options,
         )
