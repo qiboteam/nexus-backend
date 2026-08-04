@@ -783,29 +783,43 @@ class NexusClientBackend(NumpyBackend):
             ) from exc
         return circuit_ref, metadata
 
-    def execute_circuit(
-        self,
-        circuit: Circuit,
-        initial_state: Any = None,
-        nshots: int = 1000,
-        parameters: Any = None,
-        **kwargs: Any,
-    ) -> Any:
-        del kwargs
-        self._assert_supported_execution(circuit, initial_state)
-        self._ensure_connected()
-        shots = _normalize_nshots(nshots)
+    def _resolve_blocking(self, blocking: bool | None) -> bool:
+        return self.config.blocking if blocking is None else bool(blocking)
 
+    def _blocking_result(self, job: NexusJob) -> Any:
+        try:
+            result = job.result(timeout=self.config.timeout)
+        except TimeoutError as exc:
+            try:
+                statuses: Any = job.statuses()
+            except Exception:  # noqa: BLE001 - status retrieval best effort
+                statuses = "unknown"
+            raise NexusBackendError(
+                "Nexus execute job timed out/failed while waiting. "
+                f"job_id={','.join(job.job_ids)} status={statuses} reason={exc}"
+            ) from exc
+
+        LOGGER.info(
+            "Nexus execution completed",
+            extra={
+                "project": self.config.project,
+                "platform": self.config.platform,
+                "items": len(job.job_ids),
+            },
+        )
+        return result
+
+    def _submit_single_part(
+        self, circuit: Circuit, *, shots: int, parameters: Any, qnx: Any
+    ) -> JobPart:
+        self._assert_supported_execution(circuit, None)
         program_ref, metadata = self._upload_translated_program(
-            circuit,
-            parameters=parameters,
-            sequence_idx=0,
+            circuit, parameters=parameters, sequence_idx=0
         )
 
         if self.config.platform_family == "helios":
-            qnx = _import_qnexus()
             if self.config.max_cost is not None:
-                max_cost = float(self.config.max_cost)
+                max_cost: float | list[float] = float(self.config.max_cost)
             else:
                 estimated = _estimate_helios_cost(
                     qnx=qnx,
@@ -814,13 +828,11 @@ class NexusClientBackend(NumpyBackend):
                     project=self._project_ref,
                 )
                 max_cost = estimated * self.config.max_cost_factor
-            execution_items = _execute_programs(
+            execute_ref = _start_execute_job(
                 qnx=qnx,
                 programs=[program_ref],
                 n_shots=shots,
                 backend_config=self._backend_config,
-                timeout=self.config.timeout,
-                allow_incomplete=self.config.allow_incomplete,
                 language=None,
                 platform=self.config.platform,
                 job_name_prefix=self.config.job_name_prefix,
@@ -833,13 +845,23 @@ class NexusClientBackend(NumpyBackend):
                 ),
             )
         else:
-            execution_items = run_compile_execute(
+            prepared = _prepare_compiled_programs(
+                qnx=qnx,
                 programs=[program_ref],
                 backend_config=self._backend_config,
                 optimisation_level=self.config.optimisation_level,
                 n_shots=shots,
                 timeout=self.config.timeout,
-                allow_incomplete=self.config.allow_incomplete,
+                platform=self.config.platform,
+                batch_mode=False,
+                job_name_prefix=self.config.job_name_prefix,
+                project=self._project_ref,
+            )
+            execute_ref = _start_execute_job(
+                qnx=qnx,
+                programs=prepared.compiled_programs,
+                n_shots=prepared.submission_n_shots,
+                backend_config=self._backend_config,
                 language=self._resolved_language,
                 platform=self.config.platform,
                 job_name_prefix=self.config.job_name_prefix,
@@ -847,22 +869,51 @@ class NexusClientBackend(NumpyBackend):
                 max_cost=self.config.max_cost,
             )
 
-        LOGGER.info(
-            "Nexus execution completed",
-            extra={
-                "project": self.config.project,
-                "platform": self.config.platform,
-                "nshots": shots,
-                "items": len(execution_items),
-            },
+        return JobPart(
+            ref=execute_ref,
+            entries=(JobEntry(circuit=circuit, metadata=metadata, nshots=shots),),
         )
 
-        return self._map_execution_result(
-            execution_result_ref=execution_items[0],
-            circuit=circuit,
-            nshots=shots,
-            metadata=metadata,
+    def submit_circuit(
+        self,
+        circuit: Circuit,
+        nshots: Any = 1000,
+        parameters: Any = None,
+        initial_state: Any = None,
+    ) -> NexusJob:
+        """Submit a circuit for execution and return a job handle.
+
+        Blocks through upload and (on non-Helios targets) the remote
+        compile stage, then returns as soon as the execute job — the long
+        hardware-queue wait — is submitted.
+        """
+        self._assert_supported_execution(circuit, initial_state)
+        self._ensure_connected()
+        qnx = _import_qnexus()
+        part = self._submit_single_part(
+            circuit, shots=_normalize_nshots(nshots), parameters=parameters, qnx=qnx
         )
+        return NexusJob(backend=self, qnx=qnx, parts=[part], single=True)
+
+    def execute_circuit(
+        self,
+        circuit: Circuit,
+        initial_state: Any = None,
+        nshots: int = 1000,
+        parameters: Any = None,
+        blocking: bool | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        del kwargs
+        job = self.submit_circuit(
+            circuit,
+            nshots=nshots,
+            parameters=parameters,
+            initial_state=initial_state,
+        )
+        if not self._resolve_blocking(blocking):
+            return job
+        return self._blocking_result(job)
 
     def estimate_circuit(
         self,

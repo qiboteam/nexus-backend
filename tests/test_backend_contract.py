@@ -8,6 +8,7 @@ from qibo.models import Circuit
 
 import nexus.backend as backend_mod
 from nexus.errors import NexusBackendError, UnsupportedExecutionError
+from nexus.job import NexusJob
 from nexus.translation import TranslationMetadata
 
 
@@ -1299,3 +1300,127 @@ def test_upload_translated_program_wraps_upload_failures(
     )
     with pytest.raises(NexusBackendError, match="Failed to upload Helios HUGR"):
         helios_backend._upload_translated_program(make_measured_circuit(1))
+
+
+def _patch_simple_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        backend_mod.NexusClientBackend,
+        "_upload_translated_program",
+        lambda self, circuit, *, parameters=None, sequence_idx=0: (
+            f"program-ref-{sequence_idx}",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+
+
+def test_submit_circuit_returns_reusable_handle(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["execution-item"]),
+    )
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
+    )
+
+    job = backend.submit_circuit(make_measured_circuit(1), nshots=5)
+
+    assert isinstance(job, NexusJob)
+    assert job.job_id == "execute-job-1"
+    assert calls["execute"][-1]["n_shots"] == 5
+    # Compile stage already ran (block-through-compile semantics).
+    assert calls["compile"][-1]["programs"] == ["program-ref-0"]
+    assert job.done() is True
+    assert job.result() == "mapped"
+
+
+def test_execute_circuit_blocking_false_returns_handle(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["execution-item"]),
+    )
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
+    )
+
+    job = backend.execute_circuit(make_measured_circuit(1), nshots=5, blocking=False)
+    assert isinstance(job, NexusJob)
+    assert job.result() == "mapped"
+
+
+def test_backend_level_blocking_false_routes_execute_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    _patch_hseries_env(
+        monkeypatch, _make_hseries_qnx(calls, execute_items=["execution-item"])
+    )
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
+    )
+
+    nonblocking = backend_mod.NexusClientBackend(
+        platform="hseries:H2-1LE", project="proj", blocking=False
+    )
+    handle = nonblocking.execute_circuit(make_measured_circuit(1), nshots=5)
+    assert isinstance(handle, NexusJob)
+    # Per-call override still wins over the config default.
+    result = nonblocking.execute_circuit(
+        make_measured_circuit(1), nshots=5, blocking=True
+    )
+    assert result == "mapped"
+
+
+def test_blocking_execute_wraps_timeout_error(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls, execute_items=["execution-item"])
+
+    def flaky_wait(job, timeout=None):
+        if getattr(job, "id", "") == "execute-job-1":
+            raise TimeoutError("still queued")
+        return job
+
+    qnx.jobs.wait_for = flaky_wait
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+    _patch_simple_upload(monkeypatch)
+
+    with pytest.raises(NexusBackendError, match="timed out/failed while waiting"):
+        backend.execute_circuit(make_measured_circuit(1), nshots=5)
+
+
+def test_blocking_execute_wraps_timeout_error_when_status_lookup_fails(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Status retrieval in the timeout handler is best-effort: if it also
+    raises, the wrapped NexusBackendError still reports status=unknown
+    instead of masking the original timeout with a new exception."""
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls, execute_items=["execution-item"])
+
+    def flaky_wait(job, timeout=None):
+        if getattr(job, "id", "") == "execute-job-1":
+            raise TimeoutError("still queued")
+        return job
+
+    def failing_status(job):
+        raise RuntimeError("status endpoint unavailable")
+
+    qnx.jobs.wait_for = flaky_wait
+    qnx.jobs.status = failing_status
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+    _patch_simple_upload(monkeypatch)
+
+    with pytest.raises(NexusBackendError, match="timed out/failed while waiting"):
+        backend.execute_circuit(make_measured_circuit(1), nshots=5)
