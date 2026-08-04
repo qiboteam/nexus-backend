@@ -8,6 +8,7 @@ from nexus.errors import NexusBackendError
 from nexus.job import (
     JobEntry,
     JobPart,
+    NexusJob,
     TERMINAL_STATUSES,
     _job_id,
     _status_name,
@@ -108,3 +109,107 @@ def test_job_part_holds_entries() -> None:
     part = JobPart(ref=_Ref(), entries=(_entry(5),))
     assert part.entries[0].nshots == 5
     assert part.entries[0].metadata.measured_qubits == [0]
+
+
+class _FakeBackend:
+    def __init__(self) -> None:
+        self.config = types.SimpleNamespace(allow_incomplete=False)
+        self.map_calls: list[dict[str, object]] = []
+
+    def _map_execution_result(
+        self, *, execution_result_ref, circuit, nshots, metadata
+    ):
+        self.map_calls.append(
+            {
+                "ref": execution_result_ref,
+                "circuit": circuit,
+                "nshots": nshots,
+                "metadata": metadata,
+            }
+        )
+        return f"mapped-{execution_result_ref}-{nshots}"
+
+
+def _single_job(qnx, *, nshots: int = 10, backend: _FakeBackend | None = None):
+    backend = backend or _FakeBackend()
+    part = JobPart(ref=_Ref("job-1"), entries=(_entry(nshots),))
+    return NexusJob(backend=backend, qnx=qnx, parts=[part], single=True), backend
+
+
+def test_nexus_job_requires_parts() -> None:
+    with pytest.raises(ValueError, match="at least one job part"):
+        NexusJob(backend=_FakeBackend(), qnx=_jobs_ns(), parts=[], single=True)
+
+
+def test_single_part_accessors() -> None:
+    job, _ = _single_job(_jobs_ns())
+    assert job.job_ids == ("job-1",)
+    assert job.job_id == "job-1"
+    assert job.job_refs[0].id == "job-1"
+    assert job.job_ref.id == "job-1"
+    assert "job-1" in repr(job)
+
+
+def test_multi_part_single_accessors_raise() -> None:
+    parts = [
+        JobPart(ref=_Ref("job-1"), entries=(_entry(),)),
+        JobPart(ref=_Ref("job-2"), entries=(_entry(),)),
+    ]
+    job = NexusJob(backend=_FakeBackend(), qnx=_jobs_ns(), parts=parts, single=False)
+    assert job.job_ids == ("job-1", "job-2")
+    with pytest.raises(ValueError, match="job_ids"):
+        _ = job.job_id
+    with pytest.raises(ValueError, match="job_refs"):
+        _ = job.job_ref
+    with pytest.raises(ValueError, match="statuses"):
+        job.status()
+
+
+def test_statuses_and_done() -> None:
+    running = types.SimpleNamespace(
+        status=types.SimpleNamespace(value="RUNNING")
+    )
+    completed = types.SimpleNamespace(
+        status=types.SimpleNamespace(value="COMPLETED")
+    )
+    statuses = {"job-1": completed, "job-2": running}
+    qnx = _jobs_ns(status=lambda job: statuses[job.id])
+    parts = [
+        JobPart(ref=_Ref("job-1"), entries=(_entry(),)),
+        JobPart(ref=_Ref("job-2"), entries=(_entry(),)),
+    ]
+    job = NexusJob(backend=_FakeBackend(), qnx=qnx, parts=parts, single=False)
+    assert job.statuses() == [completed, running]
+    assert job.done() is False
+
+    statuses["job-2"] = types.SimpleNamespace(
+        status=types.SimpleNamespace(value="ERROR")
+    )
+    assert job.done() is True  # ERROR is terminal; done() means "not running"
+
+    single, _ = _single_job(qnx=_jobs_ns(status=lambda job: completed))
+    assert single.status() is completed
+    assert single.done() is True
+
+
+def test_cancel_cancels_every_part_and_aggregates_failures() -> None:
+    cancelled: list[str] = []
+
+    def cancel(job):
+        if job.id == "job-1":
+            raise RuntimeError("already terminal")
+        cancelled.append(job.id)
+
+    qnx = _jobs_ns(cancel=cancel)
+    parts = [
+        JobPart(ref=_Ref("job-1"), entries=(_entry(),)),
+        JobPart(ref=_Ref("job-2"), entries=(_entry(),)),
+    ]
+    job = NexusJob(backend=_FakeBackend(), qnx=qnx, parts=parts, single=False)
+    with pytest.raises(NexusBackendError, match="job-1"):
+        job.cancel()
+    assert cancelled == ["job-2"]  # failure on part 1 did not stop part 2
+
+    ok_job, _ = _single_job(_jobs_ns(cancel=lambda job: cancelled.append(job.id)))
+    ok_job.cancel()
+    assert cancelled[-1] == "job-1"

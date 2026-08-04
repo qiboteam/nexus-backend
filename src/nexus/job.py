@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from .errors import NexusBackendError
 from .translation import TranslationMetadata
@@ -75,3 +75,78 @@ def fetch_execution_items(
             f"{len(items)} items. job_id={_job_id(job_ref)}"
         )
     return items
+
+
+class NexusJob:
+    """Handle to a submitted Nexus execution (one or more execute jobs).
+
+    Modeled on :class:`concurrent.futures.Future`: submission returns
+    immediately and ``result()`` waits, downloads, and maps on demand.
+    """
+
+    def __init__(
+        self, *, backend: Any, qnx: Any, parts: Sequence[JobPart], single: bool
+    ) -> None:
+        if not parts:
+            raise ValueError("NexusJob requires at least one job part.")
+        self._backend = backend
+        self._qnx = qnx
+        self._parts: tuple[JobPart, ...] = tuple(parts)
+        self._single = bool(single)
+        self._results: list[Any] | None = None
+
+    def __repr__(self) -> str:
+        circuits = sum(len(part.entries) for part in self._parts)
+        return (
+            f"NexusJob(job_ids={self.job_ids!r}, circuits={circuits}, "
+            f"resolved={self._results is not None})"
+        )
+
+    def _only_part(self, plural_name: str) -> JobPart:
+        if len(self._parts) != 1:
+            raise ValueError(
+                f"This handle wraps {len(self._parts)} Nexus jobs; "
+                f"use {plural_name} instead."
+            )
+        return self._parts[0]
+
+    @property
+    def job_ids(self) -> tuple[str, ...]:
+        return tuple(_job_id(part.ref) for part in self._parts)
+
+    @property
+    def job_id(self) -> str:
+        return _job_id(self._only_part("job_ids").ref)
+
+    @property
+    def job_refs(self) -> tuple[Any, ...]:
+        return tuple(part.ref for part in self._parts)
+
+    @property
+    def job_ref(self) -> Any:
+        return self._only_part("job_refs").ref
+
+    def statuses(self) -> list[Any]:
+        return [self._qnx.jobs.status(part.ref) for part in self._parts]
+
+    def status(self) -> Any:
+        return self._qnx.jobs.status(self._only_part("statuses").ref)
+
+    def done(self) -> bool:
+        """Whether every underlying job stopped (successfully or not)."""
+        return all(
+            _status_name(status) in TERMINAL_STATUSES
+            for status in self.statuses()
+        )
+
+    def cancel(self) -> None:
+        errors: list[str] = []
+        for part in self._parts:
+            try:
+                self._qnx.jobs.cancel(part.ref)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"job_id={_job_id(part.ref)} reason={exc}")
+        if errors:
+            raise NexusBackendError(
+                "Failed to cancel Nexus job(s): " + "; ".join(errors)
+            )
