@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -150,3 +152,56 @@ class NexusJob:
             raise NexusBackendError(
                 "Failed to cancel Nexus job(s): " + "; ".join(errors)
             )
+
+    def _wait_for_part(self, part: JobPart, deadline: float | None) -> None:
+        remaining: float | None = None
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Nexus execute job still pending. job_id={_job_id(part.ref)}"
+                )
+        try:
+            self._qnx.jobs.wait_for(part.ref, timeout=remaining)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            # Non-destructive: the remote job keeps running; the handle
+            # stays valid, so result() may simply be called again later.
+            raise TimeoutError(
+                f"Nexus execute job still pending. job_id={_job_id(part.ref)}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            status = _best_effort_status(self._qnx, part.ref)
+            raise NexusBackendError(
+                f"Nexus execute job failed. job_id={_job_id(part.ref)} "
+                f"status={_status_name(status)} reason={exc}"
+            ) from exc
+
+    def result(self, timeout: float | None = None) -> Any:
+        """Wait for completion and return the mapped Qibo result(s).
+
+        ``timeout`` is an overall wall-clock budget in seconds; ``None``
+        (the default) waits indefinitely — deliberate for hardware-queue
+        waits that outlive any reasonable fixed timeout.
+        """
+        if self._results is None:
+            deadline = None if timeout is None else time.monotonic() + timeout
+            mapped: list[Any] = []
+            for part in self._parts:
+                self._wait_for_part(part, deadline)
+                items = fetch_execution_items(
+                    self._qnx,
+                    part.ref,
+                    allow_incomplete=self._backend.config.allow_incomplete,
+                    expected=len(part.entries),
+                )
+                for item, entry in zip(items, part.entries):
+                    mapped.append(
+                        self._backend._map_execution_result(
+                            execution_result_ref=item,
+                            circuit=entry.circuit,
+                            nshots=entry.nshots,
+                            metadata=entry.metadata,
+                        )
+                    )
+            self._results = mapped
+        return self._results[0] if self._single else list(self._results)

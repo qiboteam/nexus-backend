@@ -213,3 +213,114 @@ def test_cancel_cancels_every_part_and_aggregates_failures() -> None:
     ok_job, _ = _single_job(_jobs_ns(cancel=lambda job: cancelled.append(job.id)))
     ok_job.cancel()
     assert cancelled[-1] == "job-1"
+
+
+def test_result_single_shape_maps_and_caches() -> None:
+    calls = {"results": 0}
+
+    def results(job, allow_incomplete=False):
+        calls["results"] += 1
+        return ["item-0"]
+
+    qnx = _jobs_ns(results=results)
+    job, backend = _single_job(qnx, nshots=7)
+    assert job.result() == "mapped-item-0-7"
+    assert job.result() == "mapped-item-0-7"
+    assert calls["results"] == 1  # cached after first success
+    assert backend.map_calls[0]["nshots"] == 7
+    assert "resolved=True" in repr(job)
+
+
+def test_result_batch_shape_preserves_order_across_parts() -> None:
+    def results(job, allow_incomplete=False):
+        return {"job-1": ["a-0", "a-1"], "job-2": ["b-0"]}[job.id]
+
+    qnx = _jobs_ns(results=results)
+    parts = [
+        JobPart(ref=_Ref("job-1"), entries=(_entry(1), _entry(2))),
+        JobPart(ref=_Ref("job-2"), entries=(_entry(3),)),
+    ]
+    backend = _FakeBackend()
+    job = NexusJob(backend=backend, qnx=qnx, parts=parts, single=False)
+    assert job.result() == ["mapped-a-0-1", "mapped-a-1-2", "mapped-b-0-3"]
+
+
+def test_result_forwards_timeout_and_allow_incomplete() -> None:
+    captured: dict[str, object] = {}
+
+    def wait_for(job, timeout=None):
+        captured["timeout"] = timeout
+        return job
+
+    def results(job, allow_incomplete=False):
+        captured["allow_incomplete"] = allow_incomplete
+        return ["item-0"]
+
+    backend = _FakeBackend()
+    backend.config.allow_incomplete = True
+    job, _ = _single_job(
+        _jobs_ns(wait_for=wait_for, results=results), backend=backend
+    )
+    job.result(timeout=30.0)
+    assert captured["allow_incomplete"] is True
+    timeout = captured["timeout"]
+    assert isinstance(timeout, float) and 0 < timeout <= 30.0
+
+    job2, _ = _single_job(_jobs_ns(wait_for=wait_for, results=results))
+    job2.result()  # no timeout -> wait forever
+    assert captured["timeout"] is None
+
+
+def test_result_timeout_is_reusable() -> None:
+    attempts = {"n": 0}
+
+    def wait_for(job, timeout=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise TimeoutError("still queued")
+        return job
+
+    job, _ = _single_job(_jobs_ns(wait_for=wait_for))
+    with pytest.raises(TimeoutError, match="job-1"):
+        job.result(timeout=1.0)
+    # Handle is still usable; a later call succeeds.
+    assert job.result() == "mapped-item-0-10"
+
+
+def test_result_deadline_spans_parts() -> None:
+    import nexus.job as job_mod
+
+    clock = {"now": 100.0}
+    fake_time = types.SimpleNamespace(monotonic=lambda: clock["now"])
+
+    def slow_wait(job, timeout=None):
+        clock["now"] += 10.0  # first wait consumes the whole budget
+        return job
+
+    parts = [
+        JobPart(ref=_Ref("job-1"), entries=(_entry(),)),
+        JobPart(ref=_Ref("job-2"), entries=(_entry(),)),
+    ]
+    job = NexusJob(
+        backend=_FakeBackend(),
+        qnx=_jobs_ns(wait_for=slow_wait),
+        parts=parts,
+        single=False,
+    )
+    real_time = job_mod.time
+    job_mod.time = fake_time
+    try:
+        with pytest.raises(TimeoutError, match="job-2"):
+            job.result(timeout=5.0)
+    finally:
+        job_mod.time = real_time
+
+
+def test_result_wraps_job_failure() -> None:
+    def wait_for(job, timeout=None):
+        raise RuntimeError("Job errored with detail: quota exceeded")
+
+    qnx = _jobs_ns(wait_for=wait_for, status=lambda job: "ERROR")
+    job, _ = _single_job(qnx)
+    with pytest.raises(NexusBackendError, match="status=ERROR"):
+        job.result()
