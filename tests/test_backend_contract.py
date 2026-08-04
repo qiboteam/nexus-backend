@@ -42,9 +42,16 @@ def test_execute_circuit_contract_shape(
     backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["execution-item"]),
+    )
+
+    upload_calls: dict[str, object] = {}
 
     def fake_upload(self, circuit, *, parameters=None, sequence_idx=0):
-        calls["upload"] = {"parameters": parameters, "sequence_idx": sequence_idx}
+        upload_calls.update({"parameters": parameters, "sequence_idx": sequence_idx})
         return "program-ref", TranslationMetadata(
             measured_qubits=[0, 1],
             nqubits=2,
@@ -52,31 +59,31 @@ def test_execute_circuit_contract_shape(
             measurement_registers=["register0", "register1"],
         )
 
-    def fake_run_compile_execute(**kwargs):
-        calls["run"] = kwargs
-        return ["execution-item"]
+    map_calls: dict[str, object] = {}
 
     def fake_map(**kwargs):
-        calls["map"] = kwargs
+        map_calls.update(kwargs)
         return {"kind": "MeasurementOutcomes", "nshots": kwargs["nshots"]}
 
     monkeypatch.setattr(
         backend_mod.NexusClientBackend, "_upload_translated_program", fake_upload
     )
-    monkeypatch.setattr(backend_mod, "run_compile_execute", fake_run_compile_execute)
     monkeypatch.setattr(backend_mod, "map_nexus_result_to_qibo", fake_map)
 
-    circuit = make_measured_circuit(1)
-    result = backend.execute_circuit(circuit, nshots=123, parameters=[0.5])
+    result = backend.execute_circuit(
+        make_measured_circuit(1), nshots=123, parameters=[0.5]
+    )
 
     assert result["kind"] == "MeasurementOutcomes"
     assert result["nshots"] == 123
-    assert calls["upload"] == {"parameters": [0.5], "sequence_idx": 0}
-    assert calls["run"]["n_shots"] == 123
-    assert calls["run"]["job_name_prefix"] == "team-alpha"
-    assert calls["map"]["execution_result_ref"] == "execution-item"
-    assert calls["map"]["measured_qubits"] == [0, 1]
-    assert calls["map"]["register_order"] == ["register0", "register1"]
+    assert upload_calls == {"parameters": [0.5], "sequence_idx": 0}
+    execute_kwargs = calls["execute"][-1]
+    assert execute_kwargs["n_shots"] == 123
+    assert str(execute_kwargs["name"]).startswith("team-alpha-execute-")
+    assert calls["compile"][-1]["programs"] == ["program-ref"]
+    assert map_calls["execution_result_ref"] == "execution-item"
+    assert map_calls["measured_qubits"] == [0, 1]
+    assert map_calls["register_order"] == ["register0", "register1"]
 
 
 def test_upload_translated_program_uses_job_name_prefix(
@@ -118,8 +125,12 @@ def test_upload_translated_program_uses_job_name_prefix(
 def test_execute_circuits_cardinality_and_order(
     backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod, "_import_qnexus", lambda: _make_hseries_qnx(calls)
+    )
+
     upload_calls: list[dict[str, object]] = []
-    map_calls: list[dict[str, object]] = []
 
     def fake_upload(self, circuit, *, parameters=None, sequence_idx=0):
         upload_calls.append({"parameters": parameters, "sequence_idx": sequence_idx})
@@ -127,10 +138,7 @@ def test_execute_circuits_cardinality_and_order(
             measured_qubits=[0], nqubits=1, qasm="q"
         )
 
-    def fake_run_compile_execute(**kwargs):
-        assert kwargs["programs"] == ["program-ref-0", "program-ref-1"]
-        assert kwargs["n_shots"] == [10, 20]
-        return ["execution-item-0", "execution-item-1"]
+    map_calls: list[dict[str, object]] = []
 
     def fake_map(**kwargs):
         map_calls.append(kwargs)
@@ -139,7 +147,6 @@ def test_execute_circuits_cardinality_and_order(
     monkeypatch.setattr(
         backend_mod.NexusClientBackend, "_upload_translated_program", fake_upload
     )
-    monkeypatch.setattr(backend_mod, "run_compile_execute", fake_run_compile_execute)
     monkeypatch.setattr(backend_mod, "map_nexus_result_to_qibo", fake_map)
 
     circuits = [make_measured_circuit(1), make_measured_circuit(1)]
@@ -148,6 +155,8 @@ def test_execute_circuits_cardinality_and_order(
     )
 
     assert result == ["mapped-execution-item-0", "mapped-execution-item-1"]
+    assert calls["compile"][-1]["programs"] == ["program-ref-0", "program-ref-1"]
+    assert calls["execute"][-1]["n_shots"] == [10, 20]
     assert upload_calls == [
         {"parameters": ["a"], "sequence_idx": 0},
         {"parameters": ["b"], "sequence_idx": 1},
@@ -403,14 +412,8 @@ def test_execute_forwards_user_max_cost_on_hseries(
 ) -> None:
     """A user-supplied max_cost must cap non-Helios (paid H-series) submissions
     too, not silently apply only to the Helios path."""
-    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
-    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
-    monkeypatch.setattr(
-        backend_mod, "ensure_project", lambda project_name: "project-ref"
-    )
-    monkeypatch.setattr(
-        backend_mod, "build_nexus_backend_config", lambda cfg: "backend-config"
-    )
+    calls: dict[str, object] = {}
+    _patch_hseries_env(monkeypatch, _make_hseries_qnx(calls))
     monkeypatch.setattr(
         backend_mod.NexusClientBackend,
         "_upload_translated_program",
@@ -418,13 +421,6 @@ def test_execute_forwards_user_max_cost_on_hseries(
             "program-ref",
             TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
         ),
-    )
-    calls: dict[str, object] = {}
-    monkeypatch.setattr(
-        backend_mod,
-        "run_compile_execute",
-        lambda **kwargs: calls.update({"run": kwargs})
-        or ["item"] * len(kwargs["programs"]),
     )
     monkeypatch.setattr(
         backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
@@ -434,12 +430,12 @@ def test_execute_forwards_user_max_cost_on_hseries(
         platform="hseries:H2-1LE", project="proj", max_cost=10.0
     )
     backend.execute_circuit(make_measured_circuit(1), nshots=10)
-    assert calls["run"]["max_cost"] == 10.0
+    assert calls["execute"][-1]["max_cost"] == 10.0
 
     backend.execute_circuits(
         [make_measured_circuit(1), make_measured_circuit(1)], nshots=10
     )
-    assert calls["run"]["max_cost"] == 10.0
+    assert calls["execute"][-1]["max_cost"] == 10.0
 
 
 def test_constructor_is_lazy_and_project_defaults_none(
@@ -855,6 +851,69 @@ def _patch_helios_env(monkeypatch: pytest.MonkeyPatch, qnx: types.SimpleNamespac
     )
 
 
+def _make_hseries_qnx(
+    calls: dict[str, object], *, execute_items: list[object] | None = None
+) -> types.SimpleNamespace:
+    """qnexus stand-in covering the full hseries compile->execute pipeline."""
+
+    class CompileJobRef:
+        id = "compile-job-1"
+
+    class ExecuteJobRef:
+        id = "execute-job-1"
+
+    class CompiledItem:
+        def get_output(self):
+            return "compiled-program"
+
+    compile_ref = CompileJobRef()
+    execute_ref = ExecuteJobRef()
+
+    def start_compile_job(**kwargs):
+        calls.setdefault("compile", []).append(kwargs)
+        return compile_ref
+
+    def start_execute_job(**kwargs):
+        calls.setdefault("execute", []).append(kwargs)
+        return execute_ref
+
+    def results(job, allow_incomplete=False):
+        if isinstance(job, CompileJobRef):
+            return [CompiledItem() for _ in calls["compile"][-1]["programs"]]
+        if execute_items is not None:
+            return list(execute_items)
+        return [
+            f"execution-item-{i}"
+            for i in range(len(calls["execute"][-1]["programs"]))
+        ]
+
+    return types.SimpleNamespace(
+        start_compile_job=start_compile_job,
+        start_execute_job=start_execute_job,
+        jobs=types.SimpleNamespace(
+            wait_for=lambda job, timeout=None: job,
+            results=results,
+            status=lambda job: "COMPLETED",
+            cancel=lambda job: calls.setdefault("cancel", []).append(job),
+            get=lambda **kwargs: calls.update({"get": kwargs}) or execute_ref,
+        ),
+    )
+
+
+def _patch_hseries_env(
+    monkeypatch: pytest.MonkeyPatch, qnx: types.SimpleNamespace
+) -> None:
+    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
+    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
+    monkeypatch.setattr(
+        backend_mod, "ensure_project", lambda project_name: "project-ref"
+    )
+    monkeypatch.setattr(
+        backend_mod, "build_nexus_backend_config", lambda cfg: "backend-config"
+    )
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+
+
 def test_execute_circuit_helios_rejects_non_positive_cost_estimate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1058,14 +1117,8 @@ def test_execute_circuits_helios_result_count_mismatch(
 def test_execute_circuits_non_batch_runs_sequentially(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
-    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
-    monkeypatch.setattr(
-        backend_mod, "ensure_project", lambda project_name: "project-ref"
-    )
-    monkeypatch.setattr(
-        backend_mod, "build_nexus_backend_config", lambda cfg: "backend-config"
-    )
+    calls: dict[str, object] = {}
+    _patch_hseries_env(monkeypatch, _make_hseries_qnx(calls))
     monkeypatch.setattr(
         backend_mod.NexusClientBackend,
         "_upload_translated_program",
@@ -1073,12 +1126,6 @@ def test_execute_circuits_non_batch_runs_sequentially(
             f"program-ref-{sequence_idx}",
             TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
         ),
-    )
-    run_calls: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        backend_mod,
-        "run_compile_execute",
-        lambda **kwargs: run_calls.append(kwargs) or ["item"],
     )
     monkeypatch.setattr(
         backend_mod,
@@ -1092,14 +1139,12 @@ def test_execute_circuits_non_batch_runs_sequentially(
     circuits = [make_measured_circuit(1), make_measured_circuit(1)]
 
     assert backend.execute_circuits(circuits, nshots=7) == ["mapped-7", "mapped-7"]
-    assert [call["n_shots"] for call in run_calls] == [7, 7]
+    assert [k["n_shots"] for k in calls["execute"]] == [7, 7]
 
-    run_calls.clear()
-    assert backend.execute_circuits(circuits, nshots=[5, 6]) == [
-        "mapped-5",
-        "mapped-6",
-    ]
-    assert [call["n_shots"] for call in run_calls] == [5, 6]
+    calls["execute"].clear()
+    calls["compile"].clear()
+    assert backend.execute_circuits(circuits, nshots=[5, 6]) == ["mapped-5", "mapped-6"]
+    assert [k["n_shots"] for k in calls["execute"]] == [5, 6]
 
     with pytest.raises(ValueError, match="nshots cardinality mismatch"):
         backend.execute_circuits(circuits, nshots=[5])
@@ -1118,8 +1163,11 @@ def test_execute_circuits_batch_result_cardinality_mismatch(
             TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
         ),
     )
+    calls: dict[str, object] = {}
     monkeypatch.setattr(
-        backend_mod, "run_compile_execute", lambda **kwargs: ["only-one-item"]
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["only-one-item"]),
     )
 
     circuits = [make_measured_circuit(1), make_measured_circuit(1)]
