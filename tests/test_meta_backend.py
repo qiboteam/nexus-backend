@@ -40,3 +40,12 @@ def test_meta_backend_list_available():
         "helios": True,
         "aer": True,
     }
+
+
+def test_nexus_job_is_publicly_exported() -> None:
+    import nexus
+
+    from nexus.job import NexusJob
+
+    assert nexus.NexusJob is NexusJob
+    assert "NexusJob" in nexus.__all__
