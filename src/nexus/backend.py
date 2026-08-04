@@ -24,6 +24,7 @@ from .errors import (
     UnsupportedExecutionError,
 )
 from .helios import build_helios_hugr_package, map_helios_result_to_qibo
+from .job import JobEntry, JobPart, NexusJob, _job_id, fetch_execution_items
 from .results import map_nexus_result_to_qibo
 from .translation import TranslationMetadata, translate_qibo_to_pytket
 
@@ -101,11 +102,6 @@ def _ensure_nexus_dependencies() -> None:
         raise NexusBackendError(
             "pytket is not installed. Install nexus-backend's required dependencies."
         ) from exc
-
-
-def _job_id(job: Any) -> str:
-    value = getattr(job, "id", None)
-    return "unknown" if value is None else str(value)
 
 
 def _utc_stamp() -> str:
@@ -437,23 +433,22 @@ def _estimate_helios_costs_batch(
     return costs
 
 
-def _execute_programs(
+def _start_execute_job(
     *,
     qnx: Any,
     programs: list[Any],
     n_shots: int | list[int],
     backend_config: Any,
-    timeout: float,
-    allow_incomplete: bool,
     language: Any,
     platform: str,
     job_name_prefix: str | None = None,
     project: Any = None,
     max_cost: float | list[float] | None = None,
     n_qubits: int | list[int] | None = None,
-) -> list[Any]:
-    execute_name = _job_name(job_name_prefix, "execute", platform)
+) -> Any:
+    """Submit an execute job and return its ref without waiting."""
 
+    execute_name = _job_name(job_name_prefix, "execute", platform)
     try:
         execute_kwargs = {
             "programs": programs,
@@ -474,37 +469,42 @@ def _execute_programs(
 
     LOGGER.info(
         "Nexus execute job submitted",
-        extra={
-            "platform": platform,
-            "execute_job_id": _job_id(execute_job),
-        },
+        extra={"platform": platform, "execute_job_id": _job_id(execute_job)},
     )
+    return execute_job
 
-    _wait_for_job(
-        qnx,
-        execute_job,
-        timeout=timeout,
-        stage="execute",
+
+def _execute_programs(
+    *,
+    qnx: Any,
+    programs: list[Any],
+    n_shots: int | list[int],
+    backend_config: Any,
+    timeout: float,
+    allow_incomplete: bool,
+    language: Any,
+    platform: str,
+    job_name_prefix: str | None = None,
+    project: Any = None,
+    max_cost: float | list[float] | None = None,
+    n_qubits: int | list[int] | None = None,
+) -> list[Any]:
+    execute_job = _start_execute_job(
+        qnx=qnx,
+        programs=programs,
+        n_shots=n_shots,
+        backend_config=backend_config,
+        language=language,
+        platform=platform,
+        job_name_prefix=job_name_prefix,
+        project=project,
+        max_cost=max_cost,
+        n_qubits=n_qubits,
     )
-
-    try:
-        items = qnx.jobs.results(execute_job, allow_incomplete=allow_incomplete)
-    except Exception as exc:  # noqa: BLE001
-        status = None
-        try:
-            status = qnx.jobs.status(execute_job)
-        except Exception:  # noqa: BLE001
-            status = "unknown"
-        raise NexusBackendError(
-            f"Failed to fetch execute results. job_id={_job_id(execute_job)} status={status} reason={exc}"
-        ) from exc
-
-    if not items:
-        raise NexusBackendError(
-            f"Execute job returned no result items. job_id={_job_id(execute_job)}"
-        )
-
-    return list(items)
+    _wait_for_job(qnx, execute_job, timeout=timeout, stage="execute")
+    return fetch_execution_items(
+        qnx, execute_job, allow_incomplete=allow_incomplete, expected=None
+    )
 
 
 def _execute_prepared_compilation(
@@ -724,6 +724,18 @@ class NexusClientBackend(NumpyBackend):
                 "Shot-based Nexus targets require measurement gates in the circuit."
             )
 
+    def _translate_program(
+        self, circuit: Circuit, *, parameters: Any = None, sequence_idx: int = 0
+    ) -> tuple[Any, TranslationMetadata]:
+        """Build the platform program locally — no upload, no network."""
+        if self.config.platform_family == "helios":
+            return build_helios_hugr_package(
+                circuit,
+                parameters=parameters,
+                entrypoint_name=f"helios_entrypoint_{sequence_idx}",
+            )
+        return translate_qibo_to_pytket(circuit, parameters=parameters)
+
     def _upload_translated_program(
         self,
         circuit: Circuit,
@@ -736,15 +748,13 @@ class NexusClientBackend(NumpyBackend):
         upload_name = _job_name(
             self.config.job_name_prefix, "program", str(sequence_idx)
         )
+        program, metadata = self._translate_program(
+            circuit, parameters=parameters, sequence_idx=sequence_idx
+        )
         if self.config.platform_family == "helios":
-            hugr_package, metadata = build_helios_hugr_package(
-                circuit,
-                parameters=parameters,
-                entrypoint_name=f"helios_entrypoint_{sequence_idx}",
-            )
             try:
                 program_ref = qnx.hugr.upload(
-                    hugr_package=hugr_package,
+                    hugr_package=program,
                     name=upload_name,
                     project=self._project_ref,
                 )
@@ -754,12 +764,9 @@ class NexusClientBackend(NumpyBackend):
                 ) from exc
             return program_ref, metadata
 
-        pytket_circuit, metadata = translate_qibo_to_pytket(
-            circuit, parameters=parameters
-        )
         try:
             circuit_ref = qnx.circuits.upload(
-                circuit=pytket_circuit,
+                circuit=program,
                 name=upload_name,
                 project=self._project_ref,
             )
@@ -767,7 +774,6 @@ class NexusClientBackend(NumpyBackend):
             raise NexusBackendError(
                 f"Failed to upload circuit to Nexus: {exc}"
             ) from exc
-
         return circuit_ref, metadata
 
     def execute_circuit(
