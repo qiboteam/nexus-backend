@@ -1515,3 +1515,121 @@ def test_execute_circuits_blocking_false_returns_handle(
     job = backend.execute_circuits(circuits, nshots=3, blocking=False)
     assert isinstance(job, NexusJob)
     assert job.result() == ["mapped-execution-item-0", "mapped-execution-item-1"]
+
+
+def test_get_job_reattaches_hseries_single_circuit(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["execution-item"]),
+    )
+    translate_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        backend_mod,
+        "translate_qibo_to_pytket",
+        lambda circuit, parameters=None: translate_calls.append(
+            {"parameters": parameters}
+        )
+        or (
+            "pytket-circuit",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+    map_calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "map_nexus_result_to_qibo",
+        lambda **kwargs: map_calls.update(kwargs) or "mapped",
+    )
+
+    job = backend.get_job(
+        "execute-job-1", make_measured_circuit(1), nshots=42, parameters_list=[[0.5]]
+    )
+
+    assert calls["get"] == {"id": "execute-job-1"}
+    assert translate_calls == [{"parameters": [0.5]}]
+    assert "compile" not in calls  # reattach never re-uploads or re-compiles
+    assert job.job_id == "execute-job-1"
+    assert job.result() == "mapped"  # single shape, not a list
+    assert map_calls["nshots"] == 42
+
+
+def test_get_job_list_of_circuits_returns_batch_shape(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(
+            calls, execute_items=["execution-item-0", "execution-item-1"]
+        ),
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "translate_qibo_to_pytket",
+        lambda circuit, parameters=None: (
+            "pytket-circuit",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "map_nexus_result_to_qibo",
+        lambda **kwargs: f"mapped-{kwargs['nshots']}",
+    )
+
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    job = backend.get_job("execute-job-1", circuits, nshots=[7, 8])
+    assert job.result() == ["mapped-7", "mapped-8"]
+
+
+def test_get_job_validates_inputs_and_job_type(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls)
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+
+    with pytest.raises(ValueError, match="at least one circuit"):
+        backend.get_job("execute-job-1", [])
+    with pytest.raises(ValueError, match="parameters_list cardinality"):
+        backend.get_job(
+            "execute-job-1", [make_measured_circuit(1)], parameters_list=[None, None]
+        )
+    with pytest.raises(ValueError, match="nshots cardinality"):
+        backend.get_job(
+            "execute-job-1",
+            [make_measured_circuit(1), make_measured_circuit(1)],
+            nshots=[1],
+        )
+
+    qnx.jobs.get = lambda **kwargs: types.SimpleNamespace(
+        id="c-1", job_type="compile"
+    )
+    with pytest.raises(NexusBackendError, match="not an execute job"):
+        backend.get_job("c-1", make_measured_circuit(1))
+
+    qnx.jobs.get = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("404"))
+    with pytest.raises(NexusBackendError, match="Failed to fetch Nexus job"):
+        backend.get_job("missing", make_measured_circuit(1))
+
+
+def test_get_job_reattaches_helios(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
+    qnx = _make_helios_qnx(calls, cost_items=[(1.0, 84.0)])
+    qnx.jobs.get = lambda **kwargs: types.SimpleNamespace(
+        id="helios-exec-1", job_type="execute"
+    )
+    _patch_helios_env(monkeypatch, qnx)
+
+    backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1E", project="proj"
+    )
+    job = backend.get_job("helios-exec-1", make_measured_circuit(1), nshots=11)
+    assert job.job_id == "helios-exec-1"
+    # Metadata was re-derived via the (patched) local HUGR build; no upload ran.
+    assert job.result() == {"kind": "MeasurementOutcomes"}

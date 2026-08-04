@@ -1097,6 +1097,70 @@ class NexusClientBackend(NumpyBackend):
             single=False,
         )
 
+    def get_job(
+        self,
+        job_id: str,
+        circuits: Circuit | list[Circuit],
+        nshots: int | list[int] = 1000,
+        parameters_list: list[Any] | None = None,
+    ) -> NexusJob:
+        """Reattach to a previously submitted Nexus execute job.
+
+        The circuit(s) must be re-supplied (in submission order) because
+        result mapping needs measurement metadata that only exists locally;
+        it is re-derived deterministically by re-running the platform
+        translation — nothing is uploaded. ``parameters_list`` must be
+        re-supplied for parameterized circuits so the translation succeeds.
+        """
+        single = isinstance(circuits, Circuit)
+        circuit_list = [circuits] if single else list(circuits)
+        if not circuit_list:
+            raise ValueError("get_job requires at least one circuit.")
+        if parameters_list is None:
+            parameters_list = [None] * len(circuit_list)
+        if len(parameters_list) != len(circuit_list):
+            raise ValueError(
+                "parameters_list cardinality mismatch with circuits in get_job."
+            )
+        shot_values = _normalize_batch_nshots(nshots, len(circuit_list))
+        if isinstance(shot_values, int):
+            shot_values = [shot_values] * len(circuit_list)
+
+        self._ensure_connected()
+        qnx = _import_qnexus()
+        try:
+            job_ref = qnx.jobs.get(id=job_id)
+        except Exception as exc:  # noqa: BLE001
+            raise NexusBackendError(
+                f"Failed to fetch Nexus job {job_id}: {exc}"
+            ) from exc
+
+        job_type = getattr(job_ref, "job_type", None)
+        if job_type is not None and "execute" not in str(
+            getattr(job_type, "value", job_type)
+        ).lower():
+            raise NexusBackendError(
+                f"Job {job_id} is not an execute job (job_type={job_type})."
+            )
+
+        entries = []
+        for idx, (circuit, params, shots) in enumerate(
+            zip(circuit_list, parameters_list, shot_values)
+        ):
+            _, metadata = self._translate_program(
+                circuit, parameters=params, sequence_idx=idx
+            )
+            entries.append(
+                JobEntry(circuit=circuit, metadata=metadata, nshots=shots)
+            )
+
+        return NexusJob(
+            backend=self,
+            qnx=qnx,
+            parts=[JobPart(ref=job_ref, entries=tuple(entries))],
+            single=single,
+        )
+
     def execute_circuits(
         self,
         circuits: list[Circuit],
