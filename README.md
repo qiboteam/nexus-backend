@@ -41,6 +41,8 @@ Hardware queues can hold a job for hours. Instead of blocking, submit and
 get a `NexusJob` handle back — modeled on `concurrent.futures.Future`:
 
 ```python
+backend = qibo.get_backend()          # after qibo.set_backend("nexus", ...)
+
 job = backend.submit_circuit(circuit, nshots=1000)   # returns after submission
 job.job_id        # Nexus execute-job id (also visible in the Nexus web UI)
 job.status()      # qnexus JobStatus (QUEUED / RUNNING / COMPLETED / ...)

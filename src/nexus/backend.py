@@ -804,7 +804,7 @@ class NexusClientBackend(NumpyBackend):
             extra={
                 "project": self.config.project,
                 "platform": self.config.platform,
-                "items": len(job.job_ids),
+                "items": len(result) if isinstance(result, list) else 1,
             },
         )
         return result
