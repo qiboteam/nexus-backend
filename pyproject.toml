@@ -19,11 +19,11 @@ classifiers = [
 packages = [{ include = "nexus", from = "src" }]
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.13"
+python = ">=3.12,<3.13"
 qibo = "^0.3.2"
 qnexus = ">=0.47,<1"
 pytket = ">=2.8,<3"
-guppylang = ">=0.21,<1"
+guppylang = ">=1.0.1,<2"
 
 [tool.poetry.group.tests]
 optional = true

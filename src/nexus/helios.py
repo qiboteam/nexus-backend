@@ -72,7 +72,7 @@ def _build_entrypoint_source(
     measured_qubits = set(metadata.measured_qubits)
     for idx, qubit in enumerate(metadata.measured_qubits):
         lines.append(
-            f'    result("{_MEASUREMENT_REGISTER}[{idx}]", measure({qubit_names[qubit]}))'
+            f'    result("{_MEASUREMENT_REGISTER}[{idx}]", measure({qubit_names[qubit]}).read())'
         )
     for idx, name in enumerate(qubit_names):
         if idx not in measured_qubits:
