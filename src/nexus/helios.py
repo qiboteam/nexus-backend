@@ -49,16 +49,6 @@ def _prepare_pytket_for_guppy(pytket_circuit: Any) -> Any:
     return pytket_circuit
 
 
-def _measurement_needs_read() -> bool:
-    """guppylang >= 1.0 returns a measurement object from ``measure``; 0.x returns ``bool``."""
-    try:
-        from importlib.metadata import version
-
-        return int(version("guppylang").split(".")[0]) >= 1
-    except Exception:  # pragma: no cover - metadata unavailable
-        return True
-
-
 def _build_entrypoint_source(
     *, loaded_name: str, entrypoint_name: str, metadata: TranslationMetadata
 ) -> str:
@@ -80,11 +70,11 @@ def _build_entrypoint_source(
     lines.append(f"    {loaded_name}({', '.join(qubit_names)})")
 
     measured_qubits = set(metadata.measured_qubits)
-    read_suffix = ".read()" if _measurement_needs_read() else ""
     for idx, qubit in enumerate(metadata.measured_qubits):
+        # guppylang >= 1.0: measure() yields a Measurement; .read() is the bool.
         lines.append(
             f'    result("{_MEASUREMENT_REGISTER}[{idx}]", '
-            f"measure({qubit_names[qubit]}){read_suffix})"
+            f"measure({qubit_names[qubit]}).read())"
         )
     for idx, name in enumerate(qubit_names):
         if idx not in measured_qubits:

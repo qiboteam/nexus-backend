@@ -13,19 +13,6 @@ from nexus.helios import (
 from nexus.translation import TranslationMetadata
 
 
-def _guppylang_major() -> int:
-    from importlib.metadata import version
-
-    return int(version("guppylang").split(".")[0])
-
-
-def _measure_expr(qubit_name: str) -> str:
-    """Measurement expression the entrypoint must emit for the installed guppylang."""
-    if _guppylang_major() >= 1:
-        return f"measure({qubit_name}).read()"
-    return f"measure({qubit_name})"
-
-
 def test_build_entrypoint_source_preserves_measurement_order() -> None:
     source = _build_entrypoint_source(
         loaded_name="loaded_pytket",
@@ -35,11 +22,8 @@ def test_build_entrypoint_source_preserves_measurement_order() -> None:
         ),
     )
 
-    assert f'result("m[0]", {_measure_expr("q2")})' in source
-    assert f'result("m[1]", {_measure_expr("q0")})' in source
-    if _guppylang_major() < 1:
-        # guppylang 0.x: measure() returns a plain bool with no .read()
-        assert ".read()" not in source
+    assert 'result("m[0]", measure(q2).read())' in source
+    assert 'result("m[1]", measure(q0).read())' in source
     assert "discard(q1)" in source
 
 
