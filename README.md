@@ -68,7 +68,11 @@ job = circuit(nshots=1000)
 ```
 
 Batches work the same way: `backend.submit_circuits([c1, c2], nshots=[10, 20])`
-returns one handle whose `result()` is a list in submission order.
+returns one handle whose `result()` is a list in submission order. On H-Series
+targets with `batch_mode=False` every circuit becomes its own Nexus job
+(`job.job_ids` lists them all). If such a submission fails after some jobs were
+already queued, a `PartialSubmissionError` is raised whose `submitted_job_ids`
+names them; those jobs keep running and can be reattached or cancelled.
 
 To pick a job up from a new Python process, re-supply the circuit(s) so the
 measurement-mapping metadata can be re-derived locally (nothing is
@@ -78,6 +82,11 @@ re-uploaded):
 job = backend.get_job("<job-id>", circuit, nshots=1000)
 result = job.result()
 ```
+
+`get_job` reattaches one Nexus job at a time, so a `batch_mode=False` batch is
+picked up id by id, each with its own circuit. By default Nexus only finds jobs
+you created; pass `scope=` (a qnexus `ScopeFilterEnum`) to look up a
+teammate's job in a shared project.
 
 On non-Helios targets, submission blocks through the (fast) remote compile
 stage and returns once the execute job is queued. On Helios, submission
