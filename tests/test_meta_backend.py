@@ -44,7 +44,6 @@ def test_meta_backend_list_available():
 
 def test_nexus_job_is_publicly_exported() -> None:
     import nexus
-
     from nexus.job import NexusJob
 
     assert nexus.NexusJob is NexusJob
