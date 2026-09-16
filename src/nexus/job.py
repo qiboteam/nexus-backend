@@ -95,6 +95,9 @@ class NexusJob:
         self._qnx = qnx
         self._parts: tuple[JobPart, ...] = tuple(parts)
         self._single = bool(single)
+        # Mapped results per part index; a part is cached as soon as it is
+        # mapped, so a timeout on a later part never redoes earlier work.
+        self._mapped_parts: dict[int, list[Any]] = {}
         self._results: list[Any] | None = None
 
     def __repr__(self) -> str:
@@ -137,8 +140,7 @@ class NexusJob:
     def done(self) -> bool:
         """Whether every underlying job stopped (successfully or not)."""
         return all(
-            _status_name(status) in TERMINAL_STATUSES
-            for status in self.statuses()
+            _status_name(status) in TERMINAL_STATUSES for status in self.statuses()
         )
 
     def cancel(self) -> None:
@@ -170,10 +172,20 @@ class NexusJob:
                 f"Nexus execute job still pending. job_id={_job_id(part.ref)}"
             ) from exc
         except Exception as exc:  # noqa: BLE001
-            status = _best_effort_status(self._qnx, part.ref)
+            status = _status_name(_best_effort_status(self._qnx, part.ref))
+            job_id = _job_id(part.ref)
+            if status in TERMINAL_STATUSES and status != "COMPLETED":
+                raise NexusBackendError(
+                    f"Nexus execute job failed. job_id={job_id} "
+                    f"status={status} reason={exc}"
+                ) from exc
+            # Transport/client error while the job is still queued, running,
+            # or already complete: nothing is lost, so say so instead of
+            # "failed" (which invites a costly resubmission).
             raise NexusBackendError(
-                f"Nexus execute job failed. job_id={_job_id(part.ref)} "
-                f"status={_status_name(status)} reason={exc}"
+                "Waiting for Nexus execute job was interrupted; the job was "
+                f"not cancelled. job_id={job_id} status={status} "
+                f"reason={exc}. Call result() again to resume waiting."
             ) from exc
 
     def result(self, timeout: float | None = None) -> Any:
@@ -185,8 +197,9 @@ class NexusJob:
         """
         if self._results is None:
             deadline = None if timeout is None else time.monotonic() + timeout
-            mapped: list[Any] = []
-            for part in self._parts:
+            for idx, part in enumerate(self._parts):
+                if idx in self._mapped_parts:
+                    continue
                 self._wait_for_part(part, deadline)
                 items = fetch_execution_items(
                     self._qnx,
@@ -194,14 +207,18 @@ class NexusJob:
                     allow_incomplete=self._backend.config.allow_incomplete,
                     expected=len(part.entries),
                 )
-                for item, entry in zip(items, part.entries):
-                    mapped.append(
-                        self._backend._map_execution_result(
-                            execution_result_ref=item,
-                            circuit=entry.circuit,
-                            nshots=entry.nshots,
-                            metadata=entry.metadata,
-                        )
+                self._mapped_parts[idx] = [
+                    self._backend._map_execution_result(
+                        execution_result_ref=item,
+                        circuit=entry.circuit,
+                        nshots=entry.nshots,
+                        metadata=entry.metadata,
                     )
-            self._results = mapped
+                    for item, entry in zip(items, part.entries)
+                ]
+            self._results = [
+                mapped
+                for idx in range(len(self._parts))
+                for mapped in self._mapped_parts[idx]
+            ]
         return self._results[0] if self._single else list(self._results)

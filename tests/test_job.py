@@ -6,10 +6,10 @@ import pytest
 
 from nexus.errors import NexusBackendError
 from nexus.job import (
+    TERMINAL_STATUSES,
     JobEntry,
     JobPart,
     NexusJob,
-    TERMINAL_STATUSES,
     _job_id,
     _status_name,
     fetch_execution_items,
@@ -69,9 +69,7 @@ def test_fetch_execution_items_returns_items_and_forwards_allow_incomplete() -> 
         return ["item-0", "item-1"]
 
     qnx = _jobs_ns(results=results)
-    items = fetch_execution_items(
-        qnx, _Ref(), allow_incomplete=True, expected=2
-    )
+    items = fetch_execution_items(qnx, _Ref(), allow_incomplete=True, expected=2)
     assert items == ["item-0", "item-1"]
     assert captured["allow_incomplete"] is True
 
@@ -116,9 +114,7 @@ class _FakeBackend:
         self.config = types.SimpleNamespace(allow_incomplete=False)
         self.map_calls: list[dict[str, object]] = []
 
-    def _map_execution_result(
-        self, *, execution_result_ref, circuit, nshots, metadata
-    ):
+    def _map_execution_result(self, *, execution_result_ref, circuit, nshots, metadata):
         self.map_calls.append(
             {
                 "ref": execution_result_ref,
@@ -166,12 +162,8 @@ def test_multi_part_single_accessors_raise() -> None:
 
 
 def test_statuses_and_done() -> None:
-    running = types.SimpleNamespace(
-        status=types.SimpleNamespace(value="RUNNING")
-    )
-    completed = types.SimpleNamespace(
-        status=types.SimpleNamespace(value="COMPLETED")
-    )
+    running = types.SimpleNamespace(status=types.SimpleNamespace(value="RUNNING"))
+    completed = types.SimpleNamespace(status=types.SimpleNamespace(value="COMPLETED"))
     statuses = {"job-1": completed, "job-2": running}
     qnx = _jobs_ns(status=lambda job: statuses[job.id])
     parts = [
@@ -258,9 +250,7 @@ def test_result_forwards_timeout_and_allow_incomplete() -> None:
 
     backend = _FakeBackend()
     backend.config.allow_incomplete = True
-    job, _ = _single_job(
-        _jobs_ns(wait_for=wait_for, results=results), backend=backend
-    )
+    job, _ = _single_job(_jobs_ns(wait_for=wait_for, results=results), backend=backend)
     job.result(timeout=30.0)
     assert captured["allow_incomplete"] is True
     timeout = captured["timeout"]
@@ -324,3 +314,94 @@ def test_result_wraps_job_failure() -> None:
     job, _ = _single_job(qnx)
     with pytest.raises(NexusBackendError, match="status=ERROR"):
         job.result()
+
+
+def test_result_wait_interruption_is_not_reported_as_job_failure() -> None:
+    """A transport error while waiting must not read as 'job failed' when
+    the job is still running; the handle stays reusable."""
+    attempts = {"n": 0}
+
+    def wait_for(job, timeout=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("connection reset by peer")
+        return job
+
+    running = types.SimpleNamespace(status=types.SimpleNamespace(value="RUNNING"))
+    qnx = _jobs_ns(wait_for=wait_for, status=lambda job: running)
+    job, _ = _single_job(qnx)
+    with pytest.raises(NexusBackendError, match="interrupted") as info:
+        job.result()
+    message = str(info.value)
+    assert "failed" not in message
+    assert "status=RUNNING" in message
+    assert "result()" in message
+    assert job.result() == "mapped-item-0-10"
+
+
+def test_result_wait_interruption_with_unknown_status_is_not_a_failure() -> None:
+    def wait_for(job, timeout=None):
+        raise RuntimeError("gateway timeout")
+
+    def status(job):
+        raise RuntimeError("status endpoint unavailable")
+
+    job, _ = _single_job(_jobs_ns(wait_for=wait_for, status=status))
+    with pytest.raises(NexusBackendError, match="interrupted") as info:
+        job.result()
+    assert "status=unknown" in str(info.value)
+
+
+def test_result_wait_error_on_completed_job_is_interruption_not_failure() -> None:
+    """If the job finished but the wait call itself crashed, the result is
+    still retrievable, so the message must not claim the job failed."""
+    attempts = {"n": 0}
+
+    def wait_for(job, timeout=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("websocket closed")
+        return job
+
+    job, _ = _single_job(_jobs_ns(wait_for=wait_for, status=lambda job: "COMPLETED"))
+    with pytest.raises(NexusBackendError, match="interrupted"):
+        job.result()
+    assert job.result() == "mapped-item-0-10"
+
+
+def test_result_caches_completed_parts_across_timeout() -> None:
+    """After a timeout on part N, parts 1..N-1 are not re-waited, re-fetched
+    or re-mapped on the next result() call."""
+    fetches: list[str] = []
+    waits = {"job-2": 0}
+
+    def wait_for(job, timeout=None):
+        if job.id == "job-2":
+            waits["job-2"] += 1
+            if waits["job-2"] == 1:
+                raise TimeoutError("still queued")
+        return job
+
+    def results(job, allow_incomplete=False):
+        fetches.append(job.id)
+        return [f"{job.id}-item"]
+
+    parts = [
+        JobPart(ref=_Ref("job-1"), entries=(_entry(1),)),
+        JobPart(ref=_Ref("job-2"), entries=(_entry(2),)),
+    ]
+    backend = _FakeBackend()
+    job = NexusJob(
+        backend=backend,
+        qnx=_jobs_ns(wait_for=wait_for, results=results),
+        parts=parts,
+        single=False,
+    )
+    with pytest.raises(TimeoutError, match="job-2"):
+        job.result(timeout=5.0)
+    assert fetches == ["job-1"]
+    assert "resolved=False" in repr(job)
+
+    assert job.result() == ["mapped-job-1-item-1", "mapped-job-2-item-2"]
+    assert fetches == ["job-1", "job-2"]  # part 1 was served from the cache
+    assert len(backend.map_calls) == 2
