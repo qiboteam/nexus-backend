@@ -24,6 +24,7 @@ from .backend import (
     run_compile_execute,
 )
 from .config import NexusBackendConfig
+from .job import NexusJob
 
 # PyPI distribution name (differs from the import package name "nexus").
 _DIST_NAME = "nexus-backend"
@@ -74,6 +75,7 @@ __all__ = [
     "MetaBackend",
     "NexusBackendConfig",
     "NexusClientBackend",
+    "NexusJob",
     "PLATFORMS",
     "__version__",
     "run_compile_execute",
