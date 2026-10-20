@@ -7,7 +7,12 @@ from qibo import gates
 from qibo.models import Circuit
 
 import nexus.backend as backend_mod
-from nexus.errors import NexusBackendError, UnsupportedExecutionError
+from nexus.errors import (
+    NexusBackendError,
+    PartialSubmissionError,
+    UnsupportedExecutionError,
+)
+from nexus.job import NexusJob
 from nexus.translation import TranslationMetadata
 
 
@@ -42,9 +47,16 @@ def test_execute_circuit_contract_shape(
     backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["execution-item"]),
+    )
+
+    upload_calls: dict[str, object] = {}
 
     def fake_upload(self, circuit, *, parameters=None, sequence_idx=0):
-        calls["upload"] = {"parameters": parameters, "sequence_idx": sequence_idx}
+        upload_calls.update({"parameters": parameters, "sequence_idx": sequence_idx})
         return "program-ref", TranslationMetadata(
             measured_qubits=[0, 1],
             nqubits=2,
@@ -52,31 +64,31 @@ def test_execute_circuit_contract_shape(
             measurement_registers=["register0", "register1"],
         )
 
-    def fake_run_compile_execute(**kwargs):
-        calls["run"] = kwargs
-        return ["execution-item"]
+    map_calls: dict[str, object] = {}
 
     def fake_map(**kwargs):
-        calls["map"] = kwargs
+        map_calls.update(kwargs)
         return {"kind": "MeasurementOutcomes", "nshots": kwargs["nshots"]}
 
     monkeypatch.setattr(
         backend_mod.NexusClientBackend, "_upload_translated_program", fake_upload
     )
-    monkeypatch.setattr(backend_mod, "run_compile_execute", fake_run_compile_execute)
     monkeypatch.setattr(backend_mod, "map_nexus_result_to_qibo", fake_map)
 
-    circuit = make_measured_circuit(1)
-    result = backend.execute_circuit(circuit, nshots=123, parameters=[0.5])
+    result = backend.execute_circuit(
+        make_measured_circuit(1), nshots=123, parameters=[0.5]
+    )
 
     assert result["kind"] == "MeasurementOutcomes"
     assert result["nshots"] == 123
-    assert calls["upload"] == {"parameters": [0.5], "sequence_idx": 0}
-    assert calls["run"]["n_shots"] == 123
-    assert calls["run"]["job_name_prefix"] == "team-alpha"
-    assert calls["map"]["execution_result_ref"] == "execution-item"
-    assert calls["map"]["measured_qubits"] == [0, 1]
-    assert calls["map"]["register_order"] == ["register0", "register1"]
+    assert upload_calls == {"parameters": [0.5], "sequence_idx": 0}
+    execute_kwargs = calls["execute"][-1]
+    assert execute_kwargs["n_shots"] == 123
+    assert str(execute_kwargs["name"]).startswith("team-alpha-execute-")
+    assert calls["compile"][-1]["programs"] == ["program-ref"]
+    assert map_calls["execution_result_ref"] == "execution-item"
+    assert map_calls["measured_qubits"] == [0, 1]
+    assert map_calls["register_order"] == ["register0", "register1"]
 
 
 def test_upload_translated_program_uses_job_name_prefix(
@@ -118,8 +130,10 @@ def test_upload_translated_program_uses_job_name_prefix(
 def test_execute_circuits_cardinality_and_order(
     backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: _make_hseries_qnx(calls))
+
     upload_calls: list[dict[str, object]] = []
-    map_calls: list[dict[str, object]] = []
 
     def fake_upload(self, circuit, *, parameters=None, sequence_idx=0):
         upload_calls.append({"parameters": parameters, "sequence_idx": sequence_idx})
@@ -127,10 +141,7 @@ def test_execute_circuits_cardinality_and_order(
             measured_qubits=[0], nqubits=1, qasm="q"
         )
 
-    def fake_run_compile_execute(**kwargs):
-        assert kwargs["programs"] == ["program-ref-0", "program-ref-1"]
-        assert kwargs["n_shots"] == [10, 20]
-        return ["execution-item-0", "execution-item-1"]
+    map_calls: list[dict[str, object]] = []
 
     def fake_map(**kwargs):
         map_calls.append(kwargs)
@@ -139,7 +150,6 @@ def test_execute_circuits_cardinality_and_order(
     monkeypatch.setattr(
         backend_mod.NexusClientBackend, "_upload_translated_program", fake_upload
     )
-    monkeypatch.setattr(backend_mod, "run_compile_execute", fake_run_compile_execute)
     monkeypatch.setattr(backend_mod, "map_nexus_result_to_qibo", fake_map)
 
     circuits = [make_measured_circuit(1), make_measured_circuit(1)]
@@ -148,6 +158,8 @@ def test_execute_circuits_cardinality_and_order(
     )
 
     assert result == ["mapped-execution-item-0", "mapped-execution-item-1"]
+    assert calls["compile"][-1]["programs"] == ["program-ref-0", "program-ref-1"]
+    assert calls["execute"][-1]["n_shots"] == [10, 20]
     assert upload_calls == [
         {"parameters": ["a"], "sequence_idx": 0},
         {"parameters": ["b"], "sequence_idx": 1},
@@ -403,14 +415,8 @@ def test_execute_forwards_user_max_cost_on_hseries(
 ) -> None:
     """A user-supplied max_cost must cap non-Helios (paid H-series) submissions
     too, not silently apply only to the Helios path."""
-    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
-    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
-    monkeypatch.setattr(
-        backend_mod, "ensure_project", lambda project_name: "project-ref"
-    )
-    monkeypatch.setattr(
-        backend_mod, "build_nexus_backend_config", lambda cfg: "backend-config"
-    )
+    calls: dict[str, object] = {}
+    _patch_hseries_env(monkeypatch, _make_hseries_qnx(calls))
     monkeypatch.setattr(
         backend_mod.NexusClientBackend,
         "_upload_translated_program",
@@ -418,13 +424,6 @@ def test_execute_forwards_user_max_cost_on_hseries(
             "program-ref",
             TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
         ),
-    )
-    calls: dict[str, object] = {}
-    monkeypatch.setattr(
-        backend_mod,
-        "run_compile_execute",
-        lambda **kwargs: calls.update({"run": kwargs})
-        or ["item"] * len(kwargs["programs"]),
     )
     monkeypatch.setattr(
         backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
@@ -434,12 +433,12 @@ def test_execute_forwards_user_max_cost_on_hseries(
         platform="hseries:H2-1LE", project="proj", max_cost=10.0
     )
     backend.execute_circuit(make_measured_circuit(1), nshots=10)
-    assert calls["run"]["max_cost"] == 10.0
+    assert calls["execute"][-1]["max_cost"] == 10.0
 
     backend.execute_circuits(
         [make_measured_circuit(1), make_measured_circuit(1)], nshots=10
     )
-    assert calls["run"]["max_cost"] == 10.0
+    assert calls["execute"][-1]["max_cost"] == 10.0
 
 
 def test_constructor_is_lazy_and_project_defaults_none(
@@ -855,6 +854,68 @@ def _patch_helios_env(monkeypatch: pytest.MonkeyPatch, qnx: types.SimpleNamespac
     )
 
 
+def _make_hseries_qnx(
+    calls: dict[str, object], *, execute_items: list[object] | None = None
+) -> types.SimpleNamespace:
+    """qnexus stand-in covering the full hseries compile->execute pipeline."""
+
+    class CompileJobRef:
+        id = "compile-job-1"
+
+    class ExecuteJobRef:
+        id = "execute-job-1"
+
+    class CompiledItem:
+        def get_output(self):
+            return "compiled-program"
+
+    compile_ref = CompileJobRef()
+    execute_ref = ExecuteJobRef()
+
+    def start_compile_job(**kwargs):
+        calls.setdefault("compile", []).append(kwargs)
+        return compile_ref
+
+    def start_execute_job(**kwargs):
+        calls.setdefault("execute", []).append(kwargs)
+        return execute_ref
+
+    def results(job, allow_incomplete=False):
+        if isinstance(job, CompileJobRef):
+            return [CompiledItem() for _ in calls["compile"][-1]["programs"]]
+        if execute_items is not None:
+            return list(execute_items)
+        return [
+            f"execution-item-{i}" for i in range(len(calls["execute"][-1]["programs"]))
+        ]
+
+    return types.SimpleNamespace(
+        start_compile_job=start_compile_job,
+        start_execute_job=start_execute_job,
+        jobs=types.SimpleNamespace(
+            wait_for=lambda job, timeout=None: job,
+            results=results,
+            status=lambda job: "COMPLETED",
+            cancel=lambda job: calls.setdefault("cancel", []).append(job),
+            get=lambda **kwargs: calls.update({"get": kwargs}) or execute_ref,
+        ),
+    )
+
+
+def _patch_hseries_env(
+    monkeypatch: pytest.MonkeyPatch, qnx: types.SimpleNamespace
+) -> None:
+    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
+    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
+    monkeypatch.setattr(
+        backend_mod, "ensure_project", lambda project_name: "project-ref"
+    )
+    monkeypatch.setattr(
+        backend_mod, "build_nexus_backend_config", lambda cfg: "backend-config"
+    )
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+
+
 def test_execute_circuit_helios_rejects_non_positive_cost_estimate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1051,21 +1112,15 @@ def test_execute_circuits_helios_result_count_mismatch(
 
     backend = backend_mod.NexusClientBackend(platform="helios:Helios-1", project="proj")
     circuits = [make_measured_circuit(1), make_measured_circuit(1)]
-    with pytest.raises(NexusBackendError, match="returned 1 items"):
+    with pytest.raises(NexusBackendError, match="expected 2, got 1 items"):
         backend.execute_circuits(circuits, nshots=[10, 20])
 
 
 def test_execute_circuits_non_batch_runs_sequentially(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(backend_mod, "_ensure_nexus_dependencies", lambda: None)
-    monkeypatch.setattr(backend_mod, "authenticate", lambda **kwargs: None)
-    monkeypatch.setattr(
-        backend_mod, "ensure_project", lambda project_name: "project-ref"
-    )
-    monkeypatch.setattr(
-        backend_mod, "build_nexus_backend_config", lambda cfg: "backend-config"
-    )
+    calls: dict[str, object] = {}
+    _patch_hseries_env(monkeypatch, _make_hseries_qnx(calls))
     monkeypatch.setattr(
         backend_mod.NexusClientBackend,
         "_upload_translated_program",
@@ -1073,12 +1128,6 @@ def test_execute_circuits_non_batch_runs_sequentially(
             f"program-ref-{sequence_idx}",
             TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
         ),
-    )
-    run_calls: list[dict[str, object]] = []
-    monkeypatch.setattr(
-        backend_mod,
-        "run_compile_execute",
-        lambda **kwargs: run_calls.append(kwargs) or ["item"],
     )
     monkeypatch.setattr(
         backend_mod,
@@ -1092,14 +1141,12 @@ def test_execute_circuits_non_batch_runs_sequentially(
     circuits = [make_measured_circuit(1), make_measured_circuit(1)]
 
     assert backend.execute_circuits(circuits, nshots=7) == ["mapped-7", "mapped-7"]
-    assert [call["n_shots"] for call in run_calls] == [7, 7]
+    assert [k["n_shots"] for k in calls["execute"]] == [7, 7]
 
-    run_calls.clear()
-    assert backend.execute_circuits(circuits, nshots=[5, 6]) == [
-        "mapped-5",
-        "mapped-6",
-    ]
-    assert [call["n_shots"] for call in run_calls] == [5, 6]
+    calls["execute"].clear()
+    calls["compile"].clear()
+    assert backend.execute_circuits(circuits, nshots=[5, 6]) == ["mapped-5", "mapped-6"]
+    assert [k["n_shots"] for k in calls["execute"]] == [5, 6]
 
     with pytest.raises(ValueError, match="nshots cardinality mismatch"):
         backend.execute_circuits(circuits, nshots=[5])
@@ -1118,8 +1165,11 @@ def test_execute_circuits_batch_result_cardinality_mismatch(
             TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
         ),
     )
+    calls: dict[str, object] = {}
     monkeypatch.setattr(
-        backend_mod, "run_compile_execute", lambda **kwargs: ["only-one-item"]
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["only-one-item"]),
     )
 
     circuits = [make_measured_circuit(1), make_measured_circuit(1)]
@@ -1251,3 +1301,469 @@ def test_upload_translated_program_wraps_upload_failures(
     )
     with pytest.raises(NexusBackendError, match="Failed to upload Helios HUGR"):
         helios_backend._upload_translated_program(make_measured_circuit(1))
+
+
+def _patch_simple_upload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        backend_mod.NexusClientBackend,
+        "_upload_translated_program",
+        lambda self, circuit, *, parameters=None, sequence_idx=0: (
+            f"program-ref-{sequence_idx}",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+
+
+def test_submit_circuit_returns_reusable_handle(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["execution-item"]),
+    )
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
+    )
+
+    job = backend.submit_circuit(make_measured_circuit(1), nshots=5)
+
+    assert isinstance(job, NexusJob)
+    assert job.job_id == "execute-job-1"
+    assert calls["execute"][-1]["n_shots"] == 5
+    # Compile stage already ran (block-through-compile semantics).
+    assert calls["compile"][-1]["programs"] == ["program-ref-0"]
+    assert job.done() is True
+    assert job.result() == "mapped"
+
+
+def test_execute_circuit_blocking_false_returns_handle(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["execution-item"]),
+    )
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
+    )
+
+    job = backend.execute_circuit(make_measured_circuit(1), nshots=5, blocking=False)
+    assert isinstance(job, NexusJob)
+    assert job.result() == "mapped"
+
+
+def test_backend_level_blocking_false_routes_execute_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    _patch_hseries_env(
+        monkeypatch, _make_hseries_qnx(calls, execute_items=["execution-item"])
+    )
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
+    )
+
+    nonblocking = backend_mod.NexusClientBackend(
+        platform="hseries:H2-1LE", project="proj", blocking=False
+    )
+    handle = nonblocking.execute_circuit(make_measured_circuit(1), nshots=5)
+    assert isinstance(handle, NexusJob)
+    # Per-call override still wins over the config default.
+    result = nonblocking.execute_circuit(
+        make_measured_circuit(1), nshots=5, blocking=True
+    )
+    assert result == "mapped"
+
+
+def test_blocking_execute_wraps_timeout_error(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls, execute_items=["execution-item"])
+
+    def flaky_wait(job, timeout=None):
+        if getattr(job, "id", "") == "execute-job-1":
+            raise TimeoutError("still queued")
+        return job
+
+    qnx.jobs.wait_for = flaky_wait
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+    _patch_simple_upload(monkeypatch)
+
+    with pytest.raises(NexusBackendError, match="timed out/failed while waiting"):
+        backend.execute_circuit(make_measured_circuit(1), nshots=5)
+
+
+def test_blocking_execute_wraps_timeout_error_when_status_lookup_fails(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Status retrieval in the timeout handler is best-effort: if it also
+    raises, the wrapped NexusBackendError still reports status=unknown
+    instead of masking the original timeout with a new exception."""
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls, execute_items=["execution-item"])
+
+    def flaky_wait(job, timeout=None):
+        if getattr(job, "id", "") == "execute-job-1":
+            raise TimeoutError("still queued")
+        return job
+
+    def failing_status(job):
+        raise RuntimeError("status endpoint unavailable")
+
+    qnx.jobs.wait_for = flaky_wait
+    qnx.jobs.status = failing_status
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+    _patch_simple_upload(monkeypatch)
+
+    with pytest.raises(NexusBackendError, match="timed out/failed while waiting"):
+        backend.execute_circuit(make_measured_circuit(1), nshots=5)
+
+
+def test_submit_circuits_batched_single_part(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: _make_hseries_qnx(calls))
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod,
+        "map_nexus_result_to_qibo",
+        lambda **kwargs: f"mapped-{kwargs['execution_result_ref']}",
+    )
+
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    job = backend.submit_circuits(circuits, nshots=9)
+
+    assert isinstance(job, NexusJob)
+    assert job.job_ids == ("execute-job-1",)
+    assert len(calls["execute"]) == 1
+    assert calls["execute"][-1]["n_shots"] == [9, 9]
+    assert job.result() == ["mapped-execution-item-0", "mapped-execution-item-1"]
+
+
+def test_submit_circuits_non_batch_multi_part(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    _patch_hseries_env(monkeypatch, _make_hseries_qnx(calls))
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod,
+        "map_nexus_result_to_qibo",
+        lambda **kwargs: f"mapped-{kwargs['nshots']}",
+    )
+
+    non_batch = backend_mod.NexusClientBackend(
+        platform="hseries:H2-1LE", project="proj", batch_mode=False
+    )
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    job = non_batch.submit_circuits(circuits, nshots=[5, 6])
+
+    assert len(job.job_ids) == 2
+    assert [k["n_shots"] for k in calls["execute"]] == [5, 6]
+    with pytest.raises(ValueError, match="job_ids"):
+        _ = job.job_id
+    assert job.result() == ["mapped-5", "mapped-6"]
+
+
+def test_submit_circuits_rejects_empty_and_execute_keeps_returning_list(
+    backend: backend_mod.NexusClientBackend,
+) -> None:
+    with pytest.raises(ValueError, match="at least one circuit"):
+        backend.submit_circuits([])
+    assert backend.execute_circuits([]) == []
+
+
+def test_submit_circuits_rejects_initial_states(
+    backend: backend_mod.NexusClientBackend,
+) -> None:
+    with pytest.raises(UnsupportedExecutionError, match="initial_states"):
+        backend.submit_circuits([make_measured_circuit(1)], initial_states=[1, 0])
+
+
+def test_execute_circuits_empty_and_non_blocking_raises(
+    backend: backend_mod.NexusClientBackend,
+) -> None:
+    with pytest.raises(ValueError, match="at least one circuit"):
+        backend.execute_circuits([], blocking=False)
+
+
+def test_execute_circuits_blocking_false_returns_handle(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: _make_hseries_qnx(calls))
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod,
+        "map_nexus_result_to_qibo",
+        lambda **kwargs: f"mapped-{kwargs['execution_result_ref']}",
+    )
+
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    job = backend.execute_circuits(circuits, nshots=3, blocking=False)
+    assert isinstance(job, NexusJob)
+    assert job.result() == ["mapped-execution-item-0", "mapped-execution-item-1"]
+
+
+def test_get_job_reattaches_hseries_single_circuit(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(calls, execute_items=["execution-item"]),
+    )
+    translate_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        backend_mod,
+        "translate_qibo_to_pytket",
+        lambda circuit, parameters=None: translate_calls.append(
+            {"parameters": parameters}
+        )
+        or (
+            "pytket-circuit",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+    map_calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "map_nexus_result_to_qibo",
+        lambda **kwargs: map_calls.update(kwargs) or "mapped",
+    )
+
+    job = backend.get_job(
+        "execute-job-1", make_measured_circuit(1), nshots=42, parameters_list=[[0.5]]
+    )
+
+    assert calls["get"] == {"id": "execute-job-1"}
+    assert translate_calls == [{"parameters": [0.5]}]
+    assert "compile" not in calls  # reattach never re-uploads or re-compiles
+    assert job.job_id == "execute-job-1"
+    assert job.result() == "mapped"  # single shape, not a list
+    assert map_calls["nshots"] == 42
+
+
+def test_get_job_list_of_circuits_returns_batch_shape(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend_mod,
+        "_import_qnexus",
+        lambda: _make_hseries_qnx(
+            calls, execute_items=["execution-item-0", "execution-item-1"]
+        ),
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "translate_qibo_to_pytket",
+        lambda circuit, parameters=None: (
+            "pytket-circuit",
+            TranslationMetadata(measured_qubits=[0], nqubits=1, qasm="q"),
+        ),
+    )
+    monkeypatch.setattr(
+        backend_mod,
+        "map_nexus_result_to_qibo",
+        lambda **kwargs: f"mapped-{kwargs['nshots']}",
+    )
+
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    job = backend.get_job("execute-job-1", circuits, nshots=[7, 8])
+    assert job.result() == ["mapped-7", "mapped-8"]
+
+
+def test_get_job_validates_inputs_and_job_type(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls)
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+
+    with pytest.raises(ValueError, match="at least one circuit"):
+        backend.get_job("execute-job-1", [])
+    with pytest.raises(ValueError, match="parameters_list cardinality"):
+        backend.get_job(
+            "execute-job-1", [make_measured_circuit(1)], parameters_list=[None, None]
+        )
+    with pytest.raises(ValueError, match="nshots cardinality"):
+        backend.get_job(
+            "execute-job-1",
+            [make_measured_circuit(1), make_measured_circuit(1)],
+            nshots=[1],
+        )
+
+    qnx.jobs.get = lambda **kwargs: types.SimpleNamespace(id="c-1", job_type="compile")
+    with pytest.raises(NexusBackendError, match="not an execute job"):
+        backend.get_job("c-1", make_measured_circuit(1))
+
+    qnx.jobs.get = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("404"))
+    with pytest.raises(NexusBackendError, match="Failed to fetch Nexus job"):
+        backend.get_job("missing", make_measured_circuit(1))
+
+
+def test_get_job_reattaches_helios(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict[str, object] = {}
+    qnx = _make_helios_qnx(calls, cost_items=[(1.0, 84.0)])
+    qnx.jobs.get = lambda **kwargs: types.SimpleNamespace(
+        id="helios-exec-1", job_type="execute"
+    )
+    _patch_helios_env(monkeypatch, qnx)
+
+    backend = backend_mod.NexusClientBackend(
+        platform="helios:Helios-1E", project="proj"
+    )
+    job = backend.get_job("helios-exec-1", make_measured_circuit(1), nshots=11)
+    assert job.job_id == "helios-exec-1"
+    # Metadata was re-derived via the (patched) local HUGR build; no upload ran.
+    assert job.result() == {"kind": "MeasurementOutcomes"}
+
+
+def test_submit_circuits_non_batch_partial_failure_surfaces_submitted_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failure on part k must not orphan parts 1..k-1 silently: the error
+    names the already-queued execute jobs so they can be reattached or
+    cancelled, and leaves them running."""
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls)
+    submitted: list[str] = []
+
+    def start_execute_job(**kwargs):
+        if len(submitted) == 2:
+            raise RuntimeError("quota exhausted")
+        ref = types.SimpleNamespace(id=f"exec-{len(submitted) + 1}")
+        submitted.append(ref.id)
+        return ref
+
+    qnx.start_execute_job = start_execute_job
+    _patch_hseries_env(monkeypatch, qnx)
+    _patch_simple_upload(monkeypatch)
+
+    non_batch = backend_mod.NexusClientBackend(
+        platform="hseries:H2-1LE", project="proj", batch_mode=False
+    )
+    circuits = [make_measured_circuit(1) for _ in range(3)]
+    with pytest.raises(PartialSubmissionError, match="exec-1,exec-2") as info:
+        non_batch.submit_circuits(circuits, nshots=1)
+
+    assert info.value.submitted_job_ids == ("exec-1", "exec-2")
+    assert "quota exhausted" in str(info.value)
+    assert "get_job" in str(info.value)
+    assert "cancel" not in calls  # queued work is left running, not destroyed
+
+
+def test_submit_circuits_non_batch_first_part_failure_is_not_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failing before anything is queued re-raises the plain submission
+    error: there is nothing to reattach, so no PartialSubmissionError."""
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls)
+
+    def start_execute_job(**kwargs):
+        raise RuntimeError("rejected")
+
+    qnx.start_execute_job = start_execute_job
+    _patch_hseries_env(monkeypatch, qnx)
+    _patch_simple_upload(monkeypatch)
+
+    non_batch = backend_mod.NexusClientBackend(
+        platform="hseries:H2-1LE", project="proj", batch_mode=False
+    )
+    with pytest.raises(NexusBackendError, match="Failed to submit execute job") as info:
+        non_batch.submit_circuits([make_measured_circuit(1)] * 2, nshots=1)
+    assert type(info.value) is NexusBackendError
+
+
+def test_get_job_forwards_scope_only_when_given(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls)
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+
+    backend.get_job("execute-job-1", make_measured_circuit(1))
+    assert calls["get"] == {"id": "execute-job-1"}  # qnexus default scope
+
+    backend.get_job("execute-job-1", make_measured_circuit(1), scope="project")
+    assert calls["get"] == {"id": "execute-job-1", "scope": "project"}
+
+
+def test_get_job_batch_shape_against_single_item_job_raises_cardinality(
+    backend: backend_mod.NexusClientBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """batch_mode=False submissions have one job per circuit; reattaching
+    two circuits to one such job must fail loudly rather than mis-map."""
+    calls: dict[str, object] = {}
+    qnx = _make_hseries_qnx(calls, execute_items=["only-item"])
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: qnx)
+
+    job = backend.get_job(
+        "execute-job-1", [make_measured_circuit(1), make_measured_circuit(1)]
+    )
+    with pytest.raises(NexusBackendError, match="expected 2, got 1"):
+        job.result()
+
+
+def test_backend_level_blocking_false_routes_execute_circuits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    _patch_hseries_env(monkeypatch, _make_hseries_qnx(calls))
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod,
+        "map_nexus_result_to_qibo",
+        lambda **kwargs: f"mapped-{kwargs['execution_result_ref']}",
+    )
+
+    nonblocking = backend_mod.NexusClientBackend(
+        platform="hseries:H2-1LE", project="proj", blocking=False
+    )
+    circuits = [make_measured_circuit(1), make_measured_circuit(1)]
+    handle = nonblocking.execute_circuits(circuits, nshots=3)
+    assert isinstance(handle, NexusJob)
+    assert handle.result() == ["mapped-execution-item-0", "mapped-execution-item-1"]
+    # Per-call override still wins over the config default.
+    assert nonblocking.execute_circuits(circuits, nshots=3, blocking=True) == [
+        "mapped-execution-item-0",
+        "mapped-execution-item-1",
+    ]
+
+
+def test_blocking_execute_logs_nshots(
+    backend: backend_mod.NexusClientBackend,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    calls: dict[str, object] = {}
+    monkeypatch.setattr(backend_mod, "_import_qnexus", lambda: _make_hseries_qnx(calls))
+    _patch_simple_upload(monkeypatch)
+    monkeypatch.setattr(
+        backend_mod, "map_nexus_result_to_qibo", lambda **kwargs: "mapped"
+    )
+
+    with caplog.at_level(logging.INFO, logger=backend_mod.LOGGER.name):
+        backend.execute_circuit(make_measured_circuit(1), nshots=5)
+        backend.execute_circuits(
+            [make_measured_circuit(1), make_measured_circuit(1)], nshots=[7, 8]
+        )
+    completed = [
+        r for r in caplog.records if r.getMessage() == "Nexus execution completed"
+    ]
+    assert [r.nshots for r in completed] == [5, [7, 8]]
+    assert [r.items for r in completed] == [1, 2]

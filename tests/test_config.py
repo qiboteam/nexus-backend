@@ -242,3 +242,10 @@ def test_parse_platform_rejects_blank_family_or_name() -> None:
         parse_platform("helios: ")
     with pytest.raises(ValueError, match="Expected '<family>:<name>'"):
         parse_platform(" :Helios-1")
+
+
+def test_blocking_defaults_true_and_is_configurable() -> None:
+    from nexus.config import NexusBackendConfig
+
+    assert NexusBackendConfig().blocking is True
+    assert NexusBackendConfig(blocking=False).blocking is False
