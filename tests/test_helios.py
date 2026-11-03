@@ -22,8 +22,8 @@ def test_build_entrypoint_source_preserves_measurement_order() -> None:
         ),
     )
 
-    assert 'result("m[0]", measure(q2))' in source
-    assert 'result("m[1]", measure(q0))' in source
+    assert 'result("m[0]", measure(q2).read())' in source
+    assert 'result("m[1]", measure(q0).read())' in source
     assert "discard(q1)" in source
 
 

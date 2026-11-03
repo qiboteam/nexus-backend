@@ -26,6 +26,7 @@ class NexusBackendConfig:
     language: Any = None
     credential_login: bool | None = None
     batch_mode: bool = True
+    blocking: bool = True
     reverse_endianness: bool = False
     backend_options: dict[str, Any] = field(default_factory=dict)
     job_name_prefix: str = "qibo-nexus"

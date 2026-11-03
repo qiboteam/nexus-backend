@@ -21,9 +21,11 @@ from .config import (
 )
 from .errors import (
     NexusBackendError,
+    PartialSubmissionError,
     UnsupportedExecutionError,
 )
 from .helios import build_helios_hugr_package, map_helios_result_to_qibo
+from .job import JobEntry, JobPart, NexusJob, _job_id, fetch_execution_items
 from .results import map_nexus_result_to_qibo
 from .translation import TranslationMetadata, translate_qibo_to_pytket
 
@@ -75,6 +77,27 @@ def _normalize_batch_nshots(nshots: Any, batch_size: int) -> int | list[int]:
     return int(nshots)
 
 
+def _normalize_batch_inputs(
+    circuits: list[Any],
+    nshots: int | list[int],
+    parameters_list: list[Any] | None,
+    *,
+    context: str,
+) -> tuple[list[int], list[Any]]:
+    """Expand scalar ``nshots`` and default ``parameters_list`` per circuit."""
+
+    if parameters_list is None:
+        parameters_list = [None] * len(circuits)
+    if len(parameters_list) != len(circuits):
+        raise ValueError(
+            f"parameters_list cardinality mismatch with circuits in {context}."
+        )
+    shot_values = _normalize_batch_nshots(nshots, len(circuits))
+    if isinstance(shot_values, int):
+        shot_values = [shot_values] * len(circuits)
+    return shot_values, list(parameters_list)
+
+
 def _import_qnexus() -> Any:
     try:
         return import_module("qnexus")
@@ -101,11 +124,6 @@ def _ensure_nexus_dependencies() -> None:
         raise NexusBackendError(
             "pytket is not installed. Install nexus-backend's required dependencies."
         ) from exc
-
-
-def _job_id(job: Any) -> str:
-    value = getattr(job, "id", None)
-    return "unknown" if value is None else str(value)
 
 
 def _utc_stamp() -> str:
@@ -437,23 +455,22 @@ def _estimate_helios_costs_batch(
     return costs
 
 
-def _execute_programs(
+def _start_execute_job(
     *,
     qnx: Any,
     programs: list[Any],
     n_shots: int | list[int],
     backend_config: Any,
-    timeout: float,
-    allow_incomplete: bool,
     language: Any,
     platform: str,
     job_name_prefix: str | None = None,
     project: Any = None,
     max_cost: float | list[float] | None = None,
     n_qubits: int | list[int] | None = None,
-) -> list[Any]:
-    execute_name = _job_name(job_name_prefix, "execute", platform)
+) -> Any:
+    """Submit an execute job and return its ref without waiting."""
 
+    execute_name = _job_name(job_name_prefix, "execute", platform)
     try:
         execute_kwargs = {
             "programs": programs,
@@ -474,37 +491,42 @@ def _execute_programs(
 
     LOGGER.info(
         "Nexus execute job submitted",
-        extra={
-            "platform": platform,
-            "execute_job_id": _job_id(execute_job),
-        },
+        extra={"platform": platform, "execute_job_id": _job_id(execute_job)},
     )
+    return execute_job
 
-    _wait_for_job(
-        qnx,
-        execute_job,
-        timeout=timeout,
-        stage="execute",
+
+def _execute_programs(
+    *,
+    qnx: Any,
+    programs: list[Any],
+    n_shots: int | list[int],
+    backend_config: Any,
+    timeout: float,
+    allow_incomplete: bool,
+    language: Any,
+    platform: str,
+    job_name_prefix: str | None = None,
+    project: Any = None,
+    max_cost: float | list[float] | None = None,
+    n_qubits: int | list[int] | None = None,
+) -> list[Any]:
+    execute_job = _start_execute_job(
+        qnx=qnx,
+        programs=programs,
+        n_shots=n_shots,
+        backend_config=backend_config,
+        language=language,
+        platform=platform,
+        job_name_prefix=job_name_prefix,
+        project=project,
+        max_cost=max_cost,
+        n_qubits=n_qubits,
     )
-
-    try:
-        items = qnx.jobs.results(execute_job, allow_incomplete=allow_incomplete)
-    except Exception as exc:  # noqa: BLE001
-        status = None
-        try:
-            status = qnx.jobs.status(execute_job)
-        except Exception:  # noqa: BLE001
-            status = "unknown"
-        raise NexusBackendError(
-            f"Failed to fetch execute results. job_id={_job_id(execute_job)} status={status} reason={exc}"
-        ) from exc
-
-    if not items:
-        raise NexusBackendError(
-            f"Execute job returned no result items. job_id={_job_id(execute_job)}"
-        )
-
-    return list(items)
+    _wait_for_job(qnx, execute_job, timeout=timeout, stage="execute")
+    return fetch_execution_items(
+        qnx, execute_job, allow_incomplete=allow_incomplete, expected=None
+    )
 
 
 def _execute_prepared_compilation(
@@ -596,6 +618,7 @@ class NexusClientBackend(NumpyBackend):
         language: Any = None,
         credential_login: bool | None = None,
         batch_mode: bool = True,
+        blocking: bool = True,
         reverse_endianness: bool = False,
         job_name_prefix: str = "qibo-nexus",
         **backend_options: Any,
@@ -621,6 +644,11 @@ class NexusClientBackend(NumpyBackend):
             credential_login: Force credential-based (True) or token-based
                 (False) qnexus login; default lets qnexus decide.
             batch_mode: Submit ``execute_circuits`` as one batched job.
+            blocking: Default execution mode. When ``False``,
+                ``execute_circuit``/``execute_circuits`` (and therefore the
+                ``circuit(...)`` spelling) return a :class:`~nexus.job.NexusJob`
+                handle instead of waiting for results. Per-call
+                ``blocking=True/False`` overrides this default.
             reverse_endianness: Reverse bit order of returned bitstrings.
             job_name_prefix: Prefix for Nexus job names.
             **backend_options: Extra fields forwarded to the qnexus backend
@@ -642,6 +670,7 @@ class NexusClientBackend(NumpyBackend):
             language=language,
             credential_login=credential_login,
             batch_mode=batch_mode,
+            blocking=blocking,
             reverse_endianness=reverse_endianness,
             backend_options=backend_options,
         )
@@ -724,6 +753,18 @@ class NexusClientBackend(NumpyBackend):
                 "Shot-based Nexus targets require measurement gates in the circuit."
             )
 
+    def _translate_program(
+        self, circuit: Circuit, *, parameters: Any = None, sequence_idx: int = 0
+    ) -> tuple[Any, TranslationMetadata]:
+        """Build the platform program locally — no upload, no network."""
+        if self.config.platform_family == "helios":
+            return build_helios_hugr_package(
+                circuit,
+                parameters=parameters,
+                entrypoint_name=f"helios_entrypoint_{sequence_idx}",
+            )
+        return translate_qibo_to_pytket(circuit, parameters=parameters)
+
     def _upload_translated_program(
         self,
         circuit: Circuit,
@@ -736,15 +777,13 @@ class NexusClientBackend(NumpyBackend):
         upload_name = _job_name(
             self.config.job_name_prefix, "program", str(sequence_idx)
         )
+        program, metadata = self._translate_program(
+            circuit, parameters=parameters, sequence_idx=sequence_idx
+        )
         if self.config.platform_family == "helios":
-            hugr_package, metadata = build_helios_hugr_package(
-                circuit,
-                parameters=parameters,
-                entrypoint_name=f"helios_entrypoint_{sequence_idx}",
-            )
             try:
                 program_ref = qnx.hugr.upload(
-                    hugr_package=hugr_package,
+                    hugr_package=program,
                     name=upload_name,
                     project=self._project_ref,
                 )
@@ -754,12 +793,9 @@ class NexusClientBackend(NumpyBackend):
                 ) from exc
             return program_ref, metadata
 
-        pytket_circuit, metadata = translate_qibo_to_pytket(
-            circuit, parameters=parameters
-        )
         try:
             circuit_ref = qnx.circuits.upload(
-                circuit=pytket_circuit,
+                circuit=program,
                 name=upload_name,
                 project=self._project_ref,
             )
@@ -767,32 +803,46 @@ class NexusClientBackend(NumpyBackend):
             raise NexusBackendError(
                 f"Failed to upload circuit to Nexus: {exc}"
             ) from exc
-
         return circuit_ref, metadata
 
-    def execute_circuit(
-        self,
-        circuit: Circuit,
-        initial_state: Any = None,
-        nshots: int = 1000,
-        parameters: Any = None,
-        **kwargs: Any,
-    ) -> Any:
-        del kwargs
-        self._assert_supported_execution(circuit, initial_state)
-        self._ensure_connected()
-        shots = _normalize_nshots(nshots)
+    def _resolve_blocking(self, blocking: bool | None) -> bool:
+        return self.config.blocking if blocking is None else bool(blocking)
 
+    def _blocking_result(self, job: NexusJob, *, nshots: Any) -> Any:
+        try:
+            result = job.result(timeout=self.config.timeout)
+        except TimeoutError as exc:
+            try:
+                statuses: Any = job.statuses()
+            except Exception:  # noqa: BLE001 - status retrieval best effort
+                statuses = "unknown"
+            raise NexusBackendError(
+                "Nexus execute job timed out/failed while waiting. "
+                f"job_id={','.join(job.job_ids)} status={statuses} reason={exc}"
+            ) from exc
+
+        LOGGER.info(
+            "Nexus execution completed",
+            extra={
+                "project": self.config.project,
+                "platform": self.config.platform,
+                "nshots": nshots,
+                "items": len(result) if isinstance(result, list) else 1,
+            },
+        )
+        return result
+
+    def _submit_single_part(
+        self, circuit: Circuit, *, shots: int, parameters: Any, qnx: Any
+    ) -> JobPart:
+        self._assert_supported_execution(circuit, None)
         program_ref, metadata = self._upload_translated_program(
-            circuit,
-            parameters=parameters,
-            sequence_idx=0,
+            circuit, parameters=parameters, sequence_idx=0
         )
 
         if self.config.platform_family == "helios":
-            qnx = _import_qnexus()
             if self.config.max_cost is not None:
-                max_cost = float(self.config.max_cost)
+                max_cost: float | list[float] = float(self.config.max_cost)
             else:
                 estimated = _estimate_helios_cost(
                     qnx=qnx,
@@ -801,13 +851,11 @@ class NexusClientBackend(NumpyBackend):
                     project=self._project_ref,
                 )
                 max_cost = estimated * self.config.max_cost_factor
-            execution_items = _execute_programs(
+            execute_ref = _start_execute_job(
                 qnx=qnx,
                 programs=[program_ref],
                 n_shots=shots,
                 backend_config=self._backend_config,
-                timeout=self.config.timeout,
-                allow_incomplete=self.config.allow_incomplete,
                 language=None,
                 platform=self.config.platform,
                 job_name_prefix=self.config.job_name_prefix,
@@ -820,13 +868,23 @@ class NexusClientBackend(NumpyBackend):
                 ),
             )
         else:
-            execution_items = run_compile_execute(
+            prepared = _prepare_compiled_programs(
+                qnx=qnx,
                 programs=[program_ref],
                 backend_config=self._backend_config,
                 optimisation_level=self.config.optimisation_level,
                 n_shots=shots,
                 timeout=self.config.timeout,
-                allow_incomplete=self.config.allow_incomplete,
+                platform=self.config.platform,
+                batch_mode=False,
+                job_name_prefix=self.config.job_name_prefix,
+                project=self._project_ref,
+            )
+            execute_ref = _start_execute_job(
+                qnx=qnx,
+                programs=prepared.compiled_programs,
+                n_shots=prepared.submission_n_shots,
+                backend_config=self._backend_config,
                 language=self._resolved_language,
                 platform=self.config.platform,
                 job_name_prefix=self.config.job_name_prefix,
@@ -834,22 +892,86 @@ class NexusClientBackend(NumpyBackend):
                 max_cost=self.config.max_cost,
             )
 
-        LOGGER.info(
-            "Nexus execution completed",
-            extra={
-                "project": self.config.project,
-                "platform": self.config.platform,
-                "nshots": shots,
-                "items": len(execution_items),
-            },
+        return JobPart(
+            ref=execute_ref,
+            entries=(JobEntry(circuit=circuit, metadata=metadata, nshots=shots),),
         )
 
-        return self._map_execution_result(
-            execution_result_ref=execution_items[0],
-            circuit=circuit,
-            nshots=shots,
-            metadata=metadata,
+    def _submit_parts_sequentially(
+        self,
+        circuits: list[Circuit],
+        shot_values: list[int],
+        parameters_list: list[Any],
+        *,
+        qnx: Any,
+    ) -> list[JobPart]:
+        """Submit one execute job per circuit, never orphaning queued work.
+
+        If circuit k fails, circuits 1..k-1 are already queued on Nexus. They
+        are left running and their ids are reported via
+        :class:`PartialSubmissionError` so the caller can reattach or cancel.
+        """
+        parts: list[JobPart] = []
+        for circuit, shots, params in zip(circuits, shot_values, parameters_list):
+            try:
+                parts.append(
+                    self._submit_single_part(
+                        circuit, shots=shots, parameters=params, qnx=qnx
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not parts:
+                    raise
+                submitted = tuple(_job_id(part.ref) for part in parts)
+                raise PartialSubmissionError(
+                    f"{exc} Submission stopped at circuit {len(parts) + 1} of "
+                    f"{len(circuits)}; {len(parts)} execute job(s) already "
+                    f"queued keep running: job_ids={','.join(submitted)}. "
+                    "Reattach each with get_job(job_id, circuit) or cancel it.",
+                    submitted_job_ids=submitted,
+                ) from exc
+        return parts
+
+    def submit_circuit(
+        self,
+        circuit: Circuit,
+        nshots: Any = 1000,
+        parameters: Any = None,
+        initial_state: Any = None,
+    ) -> NexusJob:
+        """Submit a circuit for execution and return a job handle.
+
+        Blocks through upload and (on non-Helios targets) the remote
+        compile stage, then returns as soon as the execute job — the long
+        hardware-queue wait — is submitted.
+        """
+        self._assert_supported_execution(circuit, initial_state)
+        self._ensure_connected()
+        qnx = _import_qnexus()
+        part = self._submit_single_part(
+            circuit, shots=_normalize_nshots(nshots), parameters=parameters, qnx=qnx
         )
+        return NexusJob(backend=self, qnx=qnx, parts=[part], single=True)
+
+    def execute_circuit(
+        self,
+        circuit: Circuit,
+        initial_state: Any = None,
+        nshots: int = 1000,
+        parameters: Any = None,
+        blocking: bool | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        del kwargs
+        job = self.submit_circuit(
+            circuit,
+            nshots=nshots,
+            parameters=parameters,
+            initial_state=initial_state,
+        )
+        if not self._resolve_blocking(blocking):
+            return job
+        return self._blocking_result(job, nshots=_normalize_nshots(nshots))
 
     def estimate_circuit(
         self,
@@ -915,48 +1037,48 @@ class NexusClientBackend(NumpyBackend):
             job_name_prefix=self.config.job_name_prefix,
         )
 
-    def execute_circuits(
+    def submit_circuits(
         self,
         circuits: list[Circuit],
         nshots: int | list[int] = 1000,
         initial_states: Any = None,
         parameters_list: list[Any] | None = None,
-    ) -> list[Any]:
+    ) -> NexusJob:
+        """Submit circuits for execution and return a single job handle."""
         if initial_states is not None:
             raise UnsupportedExecutionError(
                 "Nexus backend does not support initial_states for execute_circuits."
             )
-
         if not circuits:
-            return []
+            raise ValueError("submit_circuits requires at least one circuit.")
         self._ensure_connected()
 
+        shot_values, parameters_list = _normalize_batch_inputs(
+            circuits, nshots, parameters_list, context="execute_circuits"
+        )
+        qnx = _import_qnexus()
+
+        if self.config.platform_family != "helios" and not self.config.batch_mode:
+            parts = self._submit_parts_sequentially(
+                circuits, shot_values, parameters_list, qnx=qnx
+            )
+            return NexusJob(backend=self, qnx=qnx, parts=parts, single=False)
+
+        program_refs: list[Any] = []
+        metadata_list: list[TranslationMetadata] = []
+        for idx, (circuit, params) in enumerate(zip(circuits, parameters_list)):
+            self._assert_supported_execution(circuit, None)
+            program_ref, metadata = self._upload_translated_program(
+                circuit, parameters=params, sequence_idx=idx
+            )
+            program_refs.append(program_ref)
+            metadata_list.append(metadata)
+
         if self.config.platform_family == "helios":
-            if parameters_list is None:
-                parameters_list = [None] * len(circuits)
-            if len(parameters_list) != len(circuits):
-                raise ValueError(
-                    "parameters_list cardinality mismatch with circuits in execute_circuits."
-                )
-            shot_values = _normalize_batch_nshots(nshots, len(circuits))
-            if isinstance(shot_values, int):
-                shot_values = [shot_values] * len(circuits)
-
-            qnx = _import_qnexus()
-            program_refs: list[Any] = []
-            metadata_list: list[TranslationMetadata] = []
-            for idx, (circuit, params) in enumerate(zip(circuits, parameters_list)):
-                self._assert_supported_execution(circuit, None)
-                program_ref, metadata = self._upload_translated_program(
-                    circuit, parameters=params, sequence_idx=idx
-                )
-                program_refs.append(program_ref)
-                metadata_list.append(metadata)
-
             max_cost: float | list[float]
             if self.config.max_cost is not None:
-                # Scalar user max_cost is forwarded as-is; qnexus broadcasts it
-                # to every program in the job.
+                # Scalar user max_cost is forwarded as-is; qnexus broadcasts
+                # it to every program in the job.
                 max_cost = float(self.config.max_cost)
             else:
                 costs = _estimate_helios_costs_batch(
@@ -966,14 +1088,11 @@ class NexusClientBackend(NumpyBackend):
                     project=self._project_ref,
                 )
                 max_cost = [float(c) * self.config.max_cost_factor for c in costs]
-
-            execution_items = _execute_programs(
+            execute_ref = _start_execute_job(
                 qnx=qnx,
                 programs=program_refs,
                 n_shots=shot_values,
                 backend_config=self._backend_config,
-                timeout=self.config.timeout,
-                allow_incomplete=self.config.allow_incomplete,
                 language=None,
                 platform=self.config.platform,
                 job_name_prefix=self.config.job_name_prefix,
@@ -985,104 +1104,149 @@ class NexusClientBackend(NumpyBackend):
                     else None
                 ),
             )
-
-            if len(execution_items) != len(circuits):
-                raise NexusBackendError(
-                    f"Helios batch execute returned {len(execution_items)} items "
-                    f"for {len(circuits)} circuits."
-                )
-
-            return [
-                self._map_execution_result(
-                    execution_result_ref=item,
-                    circuit=circuit,
-                    nshots=shots,
-                    metadata=metadata,
-                )
-                for item, circuit, metadata, shots in zip(
-                    execution_items, circuits, metadata_list, shot_values
-                )
-            ]
-
-        if not self.config.batch_mode:
-            if parameters_list is None:
-                parameters_list = [None] * len(circuits)
-            if len(parameters_list) != len(circuits):
-                raise ValueError(
-                    "parameters_list cardinality mismatch with circuits in execute_circuits."
-                )
-            if isinstance(nshots, Iterable) and not isinstance(nshots, (str, bytes)):
-                shot_values = [int(v) for v in nshots]
-                if len(shot_values) != len(circuits):
-                    raise ValueError(
-                        f"nshots cardinality mismatch: got {len(shot_values)} entries "
-                        f"for {len(circuits)} circuits."
-                    )
-            else:
-                shot_values = [int(nshots)] * len(circuits)
-            return [
-                self.execute_circuit(c, nshots=shots, parameters=params)
-                for c, shots, params in zip(circuits, shot_values, parameters_list)
-            ]
-
-        if parameters_list is None:
-            parameters_list = [None] * len(circuits)
-        if len(parameters_list) != len(circuits):
-            raise ValueError(
-                "parameters_list cardinality mismatch with circuits in execute_circuits."
+        else:
+            prepared = _prepare_compiled_programs(
+                qnx=qnx,
+                programs=program_refs,
+                backend_config=self._backend_config,
+                optimisation_level=self.config.optimisation_level,
+                n_shots=shot_values,
+                timeout=self.config.timeout,
+                platform=self.config.platform,
+                batch_mode=True,
+                job_name_prefix=self.config.job_name_prefix,
+                project=self._project_ref,
+            )
+            execute_ref = _start_execute_job(
+                qnx=qnx,
+                programs=prepared.compiled_programs,
+                n_shots=prepared.submission_n_shots,
+                backend_config=self._backend_config,
+                language=self._resolved_language,
+                platform=self.config.platform,
+                job_name_prefix=self.config.job_name_prefix,
+                project=self._project_ref,
+                max_cost=self.config.max_cost,
             )
 
-        uploaded: list[Any] = []
-        metadata_list: list[TranslationMetadata] = []
-        for idx, (circuit, params) in enumerate(zip(circuits, parameters_list)):
-            self._assert_supported_execution(circuit, None)
-            circuit_ref, metadata = self._upload_translated_program(
-                circuit,
-                parameters=params,
-                sequence_idx=idx,
-            )
-            uploaded.append(circuit_ref)
-            metadata_list.append(metadata)
-
-        batch_shots = _normalize_batch_nshots(nshots, len(circuits))
-        execution_items = run_compile_execute(
-            programs=uploaded,
-            backend_config=self._backend_config,
-            optimisation_level=self.config.optimisation_level,
-            n_shots=batch_shots,
-            timeout=self.config.timeout,
-            allow_incomplete=self.config.allow_incomplete,
-            language=self._resolved_language,
-            platform=self.config.platform,
-            job_name_prefix=self.config.job_name_prefix,
-            project=self._project_ref,
-            max_cost=self.config.max_cost,
+        entries = tuple(
+            JobEntry(circuit=circuit, metadata=metadata, nshots=shots)
+            for circuit, metadata, shots in zip(circuits, metadata_list, shot_values)
+        )
+        return NexusJob(
+            backend=self,
+            qnx=qnx,
+            parts=[JobPart(ref=execute_ref, entries=entries)],
+            single=False,
         )
 
-        if len(execution_items) != len(circuits):
+    def get_job(
+        self,
+        job_id: str,
+        circuits: Circuit | list[Circuit],
+        nshots: int | list[int] = 1000,
+        parameters_list: list[Any] | None = None,
+        scope: Any = None,
+    ) -> NexusJob:
+        """Reattach to a previously submitted Nexus execute job.
+
+        The circuit(s) must be re-supplied (in submission order) because
+        result mapping needs measurement metadata that only exists locally;
+        it is re-derived deterministically by re-running the platform
+        translation — nothing is uploaded. ``parameters_list`` must be
+        re-supplied for parameterized circuits so the translation succeeds.
+        ``scope`` (a qnexus ``ScopeFilterEnum``) widens the lookup beyond
+        the caller's own jobs, e.g. to a teammate's job in a shared project;
+        ``None`` keeps the qnexus default.
+        """
+        single = isinstance(circuits, Circuit)
+        circuit_list = [circuits] if single else list(circuits)
+        if not circuit_list:
+            raise ValueError("get_job requires at least one circuit.")
+        shot_values, parameters_list = _normalize_batch_inputs(
+            circuit_list, nshots, parameters_list, context="get_job"
+        )
+
+        self._ensure_connected()
+        qnx = _import_qnexus()
+        get_kwargs: dict[str, Any] = {"id": job_id}
+        if scope is not None:
+            get_kwargs["scope"] = scope
+        try:
+            job_ref = qnx.jobs.get(**get_kwargs)
+        except Exception as exc:  # noqa: BLE001
             raise NexusBackendError(
-                "Result cardinality mismatch after batch execution: "
-                f"expected {len(circuits)}, got {len(execution_items)}"
-            )
+                f"Failed to fetch Nexus job {job_id}: {exc}"
+            ) from exc
 
-        if isinstance(batch_shots, int):
-            shot_values = [batch_shots] * len(circuits)
-        else:
-            shot_values = batch_shots
-
-        results: list[Any] = []
-        for item, circuit, metadata, shots in zip(
-            execution_items, circuits, metadata_list, shot_values
+        job_type = getattr(job_ref, "job_type", None)
+        if (
+            job_type is not None
+            and "execute" not in str(getattr(job_type, "value", job_type)).lower()
         ):
-            results.append(
-                self._map_execution_result(
-                    execution_result_ref=item,
-                    circuit=circuit,
-                    nshots=shots,
-                    metadata=metadata,
-                )
+            raise NexusBackendError(
+                f"Job {job_id} is not an execute job (job_type={job_type})."
             )
-        return results
+
+        entries = []
+        for idx, (circuit, params, shots) in enumerate(
+            zip(circuit_list, parameters_list, shot_values)
+        ):
+            _, metadata = self._translate_program(
+                circuit, parameters=params, sequence_idx=idx
+            )
+            entries.append(JobEntry(circuit=circuit, metadata=metadata, nshots=shots))
+
+        return NexusJob(
+            backend=self,
+            qnx=qnx,
+            parts=[JobPart(ref=job_ref, entries=tuple(entries))],
+            single=single,
+        )
+
+    def execute_circuits(
+        self,
+        circuits: list[Circuit],
+        nshots: int | list[int] = 1000,
+        initial_states: Any = None,
+        parameters_list: list[Any] | None = None,
+        blocking: bool | None = None,
+    ) -> Any:
+        if initial_states is not None:
+            raise UnsupportedExecutionError(
+                "Nexus backend does not support initial_states for execute_circuits."
+            )
+        resolved = self._resolve_blocking(blocking)
+        if not circuits:
+            if resolved:
+                return []
+            raise ValueError("submit_circuits requires at least one circuit.")
+
+        if (
+            resolved
+            and self.config.platform_family != "helios"
+            and not self.config.batch_mode
+        ):
+            # Preserve strictly sequential submit->wait semantics for
+            # blocking non-batch mode.
+            shot_values, parameters_list = _normalize_batch_inputs(
+                circuits, nshots, parameters_list, context="execute_circuits"
+            )
+            return [
+                self.execute_circuit(
+                    circuit, nshots=shots, parameters=params, blocking=True
+                )
+                for circuit, shots, params in zip(
+                    circuits, shot_values, parameters_list
+                )
+            ]
+
+        job = self.submit_circuits(
+            circuits, nshots=nshots, parameters_list=parameters_list
+        )
+        if not resolved:
+            return job
+        return self._blocking_result(job, nshots=nshots)
 
     def estimate_circuits(
         self,
